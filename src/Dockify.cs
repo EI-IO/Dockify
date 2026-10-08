@@ -1,12 +1,41 @@
-﻿// Dockify —— 让 Windows 任务栏两侧不贴边、四角变圆角
-//
-// 原理：任务栏是 Explorer 的顶层窗口（主屏 Shell_TrayWnd / 副屏 Shell_SecondaryTrayWnd）。
-// 用 SetWindowRgn 给它一个「圆角矩形」窗口区域，四边各留出配置的边距，
-// 于是任务栏就被裁成一个悬空的圆角条。窗口区域不会让内容重排，
-// 所以边距要小一点（默认左右 8px），否则会切到开始按钮 / 托盘的图标。
-//
-// 目标框架：.NET Framework 4.x（Win10/11 自带），用系统自带 csc.exe 编译，无外部依赖。
-// 语言级别：C# 5（Framework 自带 csc 不支持更高版本），所以不用字符串插值 / ?. / nameof。
+// ============================================================================
+//  Dockify · v1.2
+//  Windows 11 任务栏两侧裁切 + 圆角，并可把「开始按钮 + 程序图标 + 系统托盘」
+//  压成一条居中的圆角短条（紧凑 Dock）。
+// ----------------------------------------------------------------------------
+//  它做了什么
+//    1) 用 SetWindowRgn 给任务栏窗口套一个圆角矩形区域 → 左右裁切 + 四角圆角。
+//       窗口区域只「切」不「补」，且不影响布局，所以任务栏窗口从不移动，
+//       自动隐藏/唤出与点击行为完全不受影响。
+//    2) 「紧凑 Dock」：任务栏画面由子窗口
+//       Windows.UI.Composition.DesktopWindowContentBridge（下称「内容区」）承载。
+//       改它的宽度会让 Windows 重排任务栏：程序图标组位置不变，而系统托盘贴到
+//       内容区右端。于是把内容区收窄到「图标右端 + 间距 + 托盘宽 + 余量」，
+//       托盘就紧贴图标，并且增删图标时自动伸缩。
+//    3) 托盘弹出面板（^ 隐藏图标面板）用 SetWinEventHook 跟着托盘毫秒级平移。
+// ----------------------------------------------------------------------------
+//  三条不能碰的红线（都是踩坑换来的，细节见 TaskbarEngine.BuildCompactDock 的注释）
+//    A. 内容区宽度公式里**绝不能出现内容区位置 relX**：一平移宽度就跟着膨胀，
+//       撞上「整条任务栏宽」后 Windows 会按整屏重排，短条直接报废。
+//    B. UI Automation 只在任务栏**唤出**时才有按钮，隐藏时返回空树；
+//       测不到就整轮跳过，绝不用过期数据推算。
+//    C. 区域边界必须落在内容**里侧**，两侧圆角才会显现（区域只能切、不能补）。
+// ----------------------------------------------------------------------------
+//  构建：build.cmd（或 build.ps1），用 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+//        编译，不需要 Visual Studio / .NET SDK，无第三方依赖。
+//  语言：C# 5（Framework 自带的 csc 不支持更高版本）→ 没有字符串插值 / ?. / nameof。
+//  配置：%APPDATA%\Dockify\settings.ini（首次启动自动生成，带注释、可手改）
+//  诊断：%APPDATA%\Dockify\diag.txt（写不进去时退到 %TEMP%\Dockify-diag.txt）
+// ----------------------------------------------------------------------------
+//  文件结构（自上而下）
+//    Native           全部 P/Invoke 与 Win32 常量
+//    Settings         配置读写、版本迁移、范围裁剪
+//    TaskbarEngine    核心引擎：测量 → 计算 → 套区域 / 摆内容区 / 移托盘
+//    HiddenWindow     隐藏消息窗口（接收注销、关机、分辨率变化）
+//    PctRow           设置窗口里的百分比滑块行控件（设置窗口私有）
+//    SettingsForm     设置窗口
+//    Program          单实例、托盘图标与菜单、命令行、自检与还原
+// ============================================================================
 
 using System;
 using System.Collections.Generic;
@@ -21,41 +50,77 @@ using System.Windows.Forms;
 using System.Windows.Automation;
 using Microsoft.Win32;
 
+// ===== 程序集信息（显示在"属性 → 详细信息"里，也让版本号不只是 0.0.0.0）=====
+[assembly: System.Reflection.AssemblyTitle("Dockify")]
+[assembly: System.Reflection.AssemblyProduct("Dockify")]
+[assembly: System.Reflection.AssemblyDescription("Windows 11 任务栏两侧裁切 + 圆角，并可压成居中的紧凑 Dock")]
+[assembly: System.Reflection.AssemblyCompany("Dockify contributors")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 namespace Dockify
 {
     // ---------------------------------------------------------------- Win32
 
+    /// <summary>
+    /// Win32 互操作层：本文件用到的全部 P/Invoke 与常量。这里只放声明，不放业务逻辑。
+    /// </summary>
     internal static class Native
     {
         [StructLayout(LayoutKind.Sequential)]
+        /// <summary>
+        /// Win32 RECT。注意：GetWindowRect 在 DPI 感知进程里返回的是物理像素。
+        /// </summary>
         internal struct RECT
         {
+        /// <summary>左边界（物理像素）。</summary>
             public int Left;
+        /// <summary>上边界。</summary>
             public int Top;
+        /// <summary>右边界。</summary>
             public int Right;
+        /// <summary>下边界。</summary>
             public int Bottom;
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        /// <summary>
+        /// SHAppBarMessage 用的结构体（这里只用来读「任务栏是否自动隐藏」）。
+        /// </summary>
         internal struct APPBARDATA
         {
+        /// <summary>结构体大小（调用前必须填 sizeof）。</summary>
             public int cbSize;
+        /// <summary>任务栏窗口句柄。</summary>
             public IntPtr hWnd;
+        /// <summary>回调消息（本程序不用）。</summary>
             public uint uCallbackMessage;
+        /// <summary>贴合边缘（本程序不用）。</summary>
             public uint uEdge;
+        /// <summary>任务栏矩形。</summary>
             public RECT rc;
+        /// <summary>附加值（本程序不用）。</summary>
             public IntPtr lParam;
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        /// <summary>
+        /// GetMonitorInfo 用的结构体（取显示器矩形，作为所有百分比换算的分母）。
+        /// </summary>
         internal struct MONITORINFO
         {
+        /// <summary>结构体大小。</summary>
             public int cbSize;
+        /// <summary>显示器整块矩形（物理像素）—— 所有百分比换算的分母。</summary>
             public RECT rcMonitor;
+        /// <summary>工作区矩形（扣掉任务栏）。</summary>
             public RECT rcWork;
+        /// <summary>标志位（是否主显示器等）。</summary>
             public uint dwFlags;
         }
 
+        /// <summary>
+        /// EnumWindows 回调：遍历顶层窗口，用来找任务栏。
+        /// </summary>
         internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -63,6 +128,8 @@ namespace Dockify
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         internal static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        // 取窗口标题。用来区分"承载弹窗的岛"（标题为空）和"任务切换"岛（标题是"任务切换"）。
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
@@ -82,6 +149,9 @@ namespace Dockify
         [DllImport("user32.dll")]
         internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+        /// <summary>
+        /// SetWinEventHook 回调：托盘弹出面板出现/移动时被调用（毫秒级定位用）。
+        /// </summary>
         internal delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
             int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
@@ -116,6 +186,8 @@ namespace Dockify
 
         [DllImport("user32.dll")]
         internal static extern int SetWindowRgn(IntPtr hWnd, IntPtr hRgn, bool bRedraw);
+        // 查询窗口当前区域类型：0=没有区域/失败，1=空，2=简单，3=复杂
+        [DllImport("user32.dll")] internal static extern int GetWindowRgnBox(IntPtr hWnd, out RECT lprc);
 
         [DllImport("gdi32.dll")]
         internal static extern IntPtr CreateRoundRectRgn(int nLeft, int nTop, int nRight, int nBottom,
@@ -168,8 +240,12 @@ namespace Dockify
 
     // ------------------------------------------------------------- Settings
 
+    /// <summary>
+    /// 配置：全部可调项 + 读写 + 版本迁移。尺寸类字段都是「占显示器尺寸的浮点百分比」。
+    /// </summary>
     internal sealed class Settings
     {
+        /// <summary>总开关。取消勾选立刻把任务栏还原成原样。</summary>
         public bool Enabled;
         public double MarginLeft;      // 左裁切：占任务栏宽度的百分比（支持两位小数）
         public double MarginRight;     // 右裁切：占任务栏宽度的百分比
@@ -177,17 +253,31 @@ namespace Dockify
         public double MarginBottom;    // 下边距：占任务栏高度的百分比
         public double Radius;          // 圆角圆度：占屏幕高度的百分比（两位小数）
         public bool AllMonitors;
+        /// <summary>内部常量是否按系统缩放（DPI）放大。</summary>
         public bool ScaleWithDpi;
+        /// <summary>任务栏开着自动隐藏时是否也处理（默认开：窗口区域不影响隐藏/唤出行为）。</summary>
         public bool ApplyOnAutoHide;
 
         // 显示模式：0 = 只裁两端（任务栏仍占满屏宽），2 = 紧凑 Dock（重排任务栏内容 + 贴合内容的圆角短条）
         public int Mode;
-        public int DockWidthPercent;   // 紧凑 Dock：任务栏内容区宽度（占任务栏宽度百分比）
+
         public double DockPadding;     // 短条留白：占屏幕宽度的百分比
         public double ClusterGap;      // 图标/托盘间距：占屏幕宽度的百分比
-        public bool CenterCluster;     // 紧凑 Dock：把整组内容居中
+
         public double DockOffsetX;     // 左侧裁切微调：占屏幕宽度百分比（正 = 留白，负 = 多裁贴近图标）
         public double DockWidthTrim;   // 内容长度微调：占屏幕宽度百分比（往窄了收）
+        public double DockShiftX;      // 整体偏移：占屏幕宽度百分比（正 = 往右，负 = 往左）
+        public bool VisualCenterComp;  // 视角重心补偿：勾选后短条按"视觉重心"再右移 VisualCenterBiasPct（默认关）
+        // ---- 弹出窗口跟随（悬停预览 / ^ 展开面板）----
+        // 原理：这些窗口由 Explorer 按【未加 Dock 的原始布局】定位，图标数量一变就会错位。
+        // 所以我们按「图标组相对自然居中位置的位移」实时补正 —— 见 TaskbarEngine.PopupShiftPx。
+        public bool FlyoutFollow;      // ^ 展开面板 / 隐藏图标面板：随图标变化动态跟随（默认开）
+        public bool PreviewFollow;     // 悬停预览缩略图：随图标变化动态跟随（默认开）
+        public double PreviewOffsetX;  // 悬停预览微调 %（正 = 往左），叠加在动态量之上
+        // 校准快照：用户上次调偏移时的「图标组位移」。动态量 = 当前位移 − 这个快照，
+        // 于是"调好的那一刻"偏移量分毫不差，之后图标增减自动跟随。
+        // int.MinValue = 还没校准过（首次 Dock 成功时自动写入当前值）。
+        public int CalibIconShift;
         public int SavedTaskbarAl;     // 用户原本的任务栏对齐方式（-1 = 无需还原）
         public int SettingsVersion;    // 配置版本（用于一次性迁移）
         public double FlyoutOffsetX;   // ^面板左移：占屏幕宽度百分比（0 = 不调整）
@@ -195,8 +285,8 @@ namespace Dockify
         public Settings()
         {
             Enabled = true;
-            MarginLeft = 0.4;
-            MarginRight = 0.4;
+            MarginLeft = 0.42;
+            MarginRight = 0.42;
             MarginTop = 0;
             MarginBottom = 0;
             Radius = 1.11;         // ≈12px（1080p）
@@ -212,9 +302,15 @@ namespace Dockify
             ClusterGap = 0.83;       // ≈16px：图标与托盘之间的空隙
             DockOffsetX = -1.56;     // ≈-30px：负值 = 往右多裁、贴住 Windows 图标
             DockWidthTrim = 1.04;    // ≈20px：内容区往窄了收
-            FlyoutOffsetX = 7.8;     // ≈150px：^ 隐藏图标面板左移
+            DockShiftX = 0;          // 整体偏移 %：默认 0（不再预置 0.68% 的"观感居中"偏移）
+            VisualCenterComp = false; // 默认关：短条按几何中心居中（视觉偏差因人因屏而异）
+            FlyoutFollow = true;     // 默认开：^ 隐藏图标面板随图标增减自动对齐
+            PreviewFollow = false;   // 默认关：悬停预览在本系统上没有可移动窗口，跟随无收益（详见 README）
+            PreviewOffsetX = 0;      // 悬停预览残差（先用动态量，不够再调）
+            CalibIconShift = int.MinValue;   // 未校准 → 首次 Dock 成功时自动取当前几何
+            FlyoutOffsetX = 0;       // 默认 0：^ 面板不需要补偿（见 FlyoutFollow 的说明）
             SavedTaskbarAl = -1;
-            SettingsVersion = 4;
+            SettingsVersion = 5;
         }
 
         public bool IsDock
@@ -245,6 +341,9 @@ namespace Dockify
 
         // 旧版本（TaskbarRound / 任务栏圆角）的配置目录 → 自动搬一次，避免用户重调
         private static bool _oldConfigChecked;
+        /// <summary>
+        /// 把旧版本（TaskbarRound / 任务栏圆角）的配置搬过来，只做一次、只在没有新配置时做。
+        /// </summary>
         private static void MigrateOldConfigOnce()
         {
             if (_oldConfigChecked) return;
@@ -268,6 +367,9 @@ namespace Dockify
             catch { return false; }
         }
 
+        /// <summary>
+        /// 复制一份。设置窗口用它做「工作副本」：改动即时预览，点取消则丢弃。
+        /// </summary>
         public Settings Clone()
         {
             Settings s = new Settings();
@@ -281,18 +383,27 @@ namespace Dockify
             s.ScaleWithDpi = ScaleWithDpi;
             s.ApplyOnAutoHide = ApplyOnAutoHide;
             s.Mode = Mode;
-            s.DockWidthPercent = DockWidthPercent;
+
             s.DockPadding = DockPadding;
             s.ClusterGap = ClusterGap;
-            s.CenterCluster = CenterCluster;
+
             s.DockOffsetX = DockOffsetX;
             s.DockWidthTrim = DockWidthTrim;
+            s.DockShiftX = DockShiftX;
+            s.VisualCenterComp = VisualCenterComp;
+            s.FlyoutFollow = FlyoutFollow;
+            s.PreviewFollow = PreviewFollow;
+            s.PreviewOffsetX = PreviewOffsetX;
+            s.CalibIconShift = CalibIconShift;
             s.SavedTaskbarAl = SavedTaskbarAl;
             s.SettingsVersion = SettingsVersion;
             s.FlyoutOffsetX = FlyoutOffsetX;
             return s;
         }
 
+        /// <summary>
+        /// 从另一份配置覆盖全部字段（滑块改动后推给引擎用的就是它）。
+        /// </summary>
         public void CopyFrom(Settings other)
         {
             Enabled = other.Enabled;
@@ -305,48 +416,85 @@ namespace Dockify
             ScaleWithDpi = other.ScaleWithDpi;
             ApplyOnAutoHide = other.ApplyOnAutoHide;
             Mode = other.Mode;
-            DockWidthPercent = other.DockWidthPercent;
+
             DockPadding = other.DockPadding;
             ClusterGap = other.ClusterGap;
-            CenterCluster = other.CenterCluster;
+
             DockOffsetX = other.DockOffsetX;
             DockWidthTrim = other.DockWidthTrim;
+            DockShiftX = other.DockShiftX;
+            VisualCenterComp = other.VisualCenterComp;
+            FlyoutFollow = other.FlyoutFollow;
+            PreviewFollow = other.PreviewFollow;
+            PreviewOffsetX = other.PreviewOffsetX;
+            CalibIconShift = other.CalibIconShift;
             SavedTaskbarAl = other.SavedTaskbarAl;
             SettingsVersion = other.SettingsVersion;
             FlyoutOffsetX = other.FlyoutOffsetX;
         }
 
+        /// <summary>
+        /// 把「影响该不该重刷区域」的全部设置拼成一个字符串。只有它变了才重新套区域，避免无谓重绘。
+        /// </summary>
+        /// <returns>签名串。与上一次不同才需要重新套区域。</returns>
         public string Signature()
         {
-            return string.Format(CultureInfo.InvariantCulture, "{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}",
-                Enabled ? 1 : 0,
-                "0",   // MarginLeft 之类已单独进签名，见下
-                "0",
+            // 影响「该不该重刷区域」的全部设置。
+            // 用 Join 拼接而不是 string.Format —— 之前占位符只有 12 个、参数却有 15 个，
+            // 多出来的被静默忽略，导致「短条留白 / 左侧裁切微调」掉出签名、改了不重刷。
+            string[] parts = new string[]
+            {
+                Enabled ? "1" : "0",
+                MarginLeft.ToString("0.###", CultureInfo.InvariantCulture),
                 MarginRight.ToString("0.###", CultureInfo.InvariantCulture),
                 MarginTop.ToString("0.###", CultureInfo.InvariantCulture),
-                MarginBottom.ToString("0.###", CultureInfo.InvariantCulture), Radius,
-                AllMonitors ? 1 : 0, ScaleWithDpi ? 1 : 0, Mode, DockWidthPercent, DockPadding,
-                CenterCluster ? 1 : 0, DockOffsetX);
+                MarginBottom.ToString("0.###", CultureInfo.InvariantCulture),
+                Radius.ToString("0.###", CultureInfo.InvariantCulture),
+                AllMonitors ? "1" : "0",
+                ScaleWithDpi ? "1" : "0",
+                ApplyOnAutoHide ? "1" : "0",
+                Mode.ToString(CultureInfo.InvariantCulture),
+                DockPadding.ToString("0.###", CultureInfo.InvariantCulture),
+                ClusterGap.ToString("0.###", CultureInfo.InvariantCulture),
+                DockOffsetX.ToString("0.###", CultureInfo.InvariantCulture),
+                DockWidthTrim.ToString("0.###", CultureInfo.InvariantCulture),
+                DockShiftX.ToString("0.###", CultureInfo.InvariantCulture),
+                VisualCenterComp ? "1" : "0",
+                FlyoutFollow ? "1" : "0",
+                PreviewFollow ? "1" : "0",
+                PreviewOffsetX.ToString("0.###", CultureInfo.InvariantCulture),
+                FlyoutOffsetX.ToString("0.###", CultureInfo.InvariantCulture)
+            };
+            return string.Join("|", parts);
         }
 
+        /// <summary>
+        /// 状态栏与诊断日志用的一句话摘要。
+        /// </summary>
+        /// <returns>形如「紧凑 Dock · 间距 0.83% · 留白 1.4% · …」的一句话摘要。</returns>
         public string Describe()
         {
             if (IsDock)
             {
-                return string.Format(CultureInfo.InvariantCulture, "紧凑 Dock · 间距 {0:0.##}% · 留白 {1:0.##}% · 圆角 {2:0.##}% · 左微调 {3:0.##}%",
-                    ClusterGap, DockPadding, Radius, DockOffsetX);
+                return string.Format(CultureInfo.InvariantCulture, "紧凑 Dock · 间距 {0:0.##}% · 留白 {1:0.##}% · 圆角 {2:0.##}% · 左微调 {3:0.##}% · 整体偏移 {4:0.##}%",
+                    ClusterGap, DockPadding, Radius, DockOffsetX, DockShiftX);
             }
             return string.Format(CultureInfo.InvariantCulture, "裁两端 · 左 {0:0.##}% 右 {1:0.##}% · 圆角 {2:0.##}%",
                 MarginLeft, MarginRight, Radius);
         }
 
+        /// <summary>
+        /// 读配置。文件不存在 → 返回出厂默认；老版本配置按 SettingsVersion 逐级迁移。
+        /// </summary>
+        /// <returns>读到的配置。文件不存在时返回出厂默认；老配置会先逐级迁移再返回。</returns>
         public static Settings Load()
         {
             MigrateOldConfigOnce();
             Settings s = new Settings();
+            bool sawVersionKey = false;
             try
             {
-                if (!File.Exists(FilePath)) return s;
+                if (!File.Exists(FilePath)) return s;     // 没有配置文件 → 用出厂默认（已是 v4）
                 string[] lines = File.ReadAllLines(FilePath, Encoding.UTF8);
                 for (int i = 0; i < lines.Length; i++)
                 {
@@ -376,22 +524,33 @@ namespace Dockify
                             // 旧的 Mode=1（移动整个任务栏窗口）已被证明会被 Windows 驳回，统一并到紧凑 Dock
                             if (hasInt) s.Mode = (n == 0 ? 0 : 2);
                             break;
-                        case "dockwidthpercent": if (hasInt) s.DockWidthPercent = Clamp(n, 20, 100); break;
+
                         case "dockpadding": if (hasDbl) s.DockPadding = ClampD(d, 0, 2000); break;
                         case "clustergap": if (hasDbl) s.ClusterGap = ClampD(d, 0, 2000); break;
-                        case "centercluster": s.CenterCluster = b; break;
+
                         case "dockoffsetx": if (hasDbl) s.DockOffsetX = ClampD(d, -2000, 2000); break;
                         case "dockwidthtrim": if (hasDbl) s.DockWidthTrim = ClampD(d, 0, 2000); break;
+                        case "dockshiftx": if (hasDbl) s.DockShiftX = ClampD(d, -2000, 2000); break;
+                        case "visualcentercomp": s.VisualCenterComp = b; break;
+                        case "flyoutfollow": s.FlyoutFollow = b; break;
+                        case "previewfollow": s.PreviewFollow = b; break;
+                        case "previewoffsetx": if (hasDbl) s.PreviewOffsetX = ClampD(d, -2000, 2000); break;
+                        case "calibiconshift": if (hasInt) s.CalibIconShift = n; break;
                         case "savedtaskbaral": if (hasInt) s.SavedTaskbarAl = Clamp(n, -1, 1); break;
-                        case "settingsversion": if (hasInt) s.SettingsVersion = n; break;
+                        case "settingsversion": if (hasInt) { s.SettingsVersion = n; sawVersionKey = true; } break;
                         case "flyoutoffsetx": if (hasDbl) s.FlyoutOffsetX = ClampD(d, 0, 2000); break;
                     }
                 }
             }
             catch { /* 配置读不出来就用默认值 */ }
+            // 老版本（v1~v3）的 ini 里根本没有 SettingsVersion 这个键，若不特判就会被当成出厂值 v4
+            if (!sawVersionKey) s.SettingsVersion = 1;
             return s;
         }
 
+        /// <summary>
+        /// 写回 ini。失败不抛异常（托盘程序不该为写配置崩），原因记在 LastSaveError 里供诊断查看。
+        /// </summary>
         public void Save()
         {
             try
@@ -410,12 +569,24 @@ namespace Dockify
                 sb.AppendLine("ApplyOnAutoHide=" + (ApplyOnAutoHide ? "1" : "0"));
                 sb.AppendLine("# Mode: 0 = 只裁两端, 2 = 紧凑 Dock（内容居中 + 贴合内容的圆角短条）");
                 sb.AppendLine("Mode=" + Mode.ToString(CultureInfo.InvariantCulture));
-                sb.AppendLine("DockWidthPercent=" + DockWidthPercent.ToString(CultureInfo.InvariantCulture));
+
                 sb.AppendLine("DockPadding=" + DockPadding.ToString("0.###", CultureInfo.InvariantCulture));
                 sb.AppendLine("ClusterGap=" + ClusterGap.ToString("0.###", CultureInfo.InvariantCulture));
-                sb.AppendLine("CenterCluster=" + (CenterCluster ? "1" : "0"));
+
                 sb.AppendLine("DockOffsetX=" + DockOffsetX.ToString("0.###", CultureInfo.InvariantCulture));
                 sb.AppendLine("DockWidthTrim=" + DockWidthTrim.ToString("0.###", CultureInfo.InvariantCulture));
+                sb.AppendLine("# DockShiftX: 整体偏移 %（屏宽），正 = 往右，负 = 往左，0 = 自动居中");
+                sb.AppendLine("DockShiftX=" + DockShiftX.ToString("0.###", CultureInfo.InvariantCulture));
+                sb.AppendLine("# VisualCenterComp: 1 = 开启视角重心补偿，0 = 关闭（默认）");
+                sb.AppendLine("VisualCenterComp=" + (VisualCenterComp ? "1" : "0"));
+                sb.AppendLine("# ---- 弹出窗口跟随（悬停预览 / ^ 展开面板）----");
+                sb.AppendLine("# FlyoutFollow/PreviewFollow: 1 = 随图标增减自动对齐（推荐），0 = 只用固定微调");
+                sb.AppendLine("FlyoutFollow=" + (FlyoutFollow ? "1" : "0"));
+                sb.AppendLine("PreviewFollow=" + (PreviewFollow ? "1" : "0"));
+                sb.AppendLine("# PreviewOffsetX: 悬停预览微调 %（正 = 往左），叠加在动态跟随之上");
+                sb.AppendLine("PreviewOffsetX=" + PreviewOffsetX.ToString("0.###", CultureInfo.InvariantCulture));
+                sb.AppendLine("# CalibIconShift: 校准时记录的图标组位移（程序内部用，勿手改；-2147483648 = 待校准）");
+                sb.AppendLine("CalibIconShift=" + CalibIconShift.ToString(CultureInfo.InvariantCulture));
                 sb.AppendLine("SavedTaskbarAl=" + SavedTaskbarAl.ToString(CultureInfo.InvariantCulture));
                 sb.AppendLine("SettingsVersion=" + SettingsVersion.ToString(CultureInfo.InvariantCulture));
                 sb.AppendLine("FlyoutOffsetX=" + FlyoutOffsetX.ToString("0.###", CultureInfo.InvariantCulture));
@@ -425,6 +596,67 @@ namespace Dockify
         }
 
         // 把百分比字段统一裁剪到界面允许的范围（迁移完成后调用一次）
+        /// <summary>
+        /// 配置迁移链：必须按 v1 → v2 → v3 → v4 的顺序逐级做，每级只做一次。
+        /// 由 Program 在读取配置后调用；结束后统一 ClampAll 裁到合法范围。
+        /// </summary>
+        /// <param name="boot">刚读出来的配置，会被就地修改并存盘。</param>
+        public static void Migrate(Settings boot)
+        {
+            // ===== 配置迁移链：必须按 v1 → v2 → v3 → v4 的顺序逐级做，每级只做一次 =====
+            // （原来的顺序是把版本先改成 4，再判断"版本 < 3"，导致老配置的裁切量永远换算不到 ✗）
+            double sw = 1920, sh = 1080;
+            try { sw = Screen.PrimaryScreen.Bounds.Width; sh = Screen.PrimaryScreen.Bounds.Height; } catch { }
+            if (sw < 100) sw = 1920;
+            if (sh < 100) sh = 1080;
+
+            if (boot.SettingsVersion < 2)
+            {
+                // 那时"托盘面板跟随"默认开着，实测会把面板推偏（补偿了两次），改为关闭
+                boot.SettingsVersion = 2;
+                boot.Save();
+            }
+            if (boot.SettingsVersion < 3)
+            {
+                // 裁切量：v2 及以前是「像素」→ v3 起改成「占屏幕尺寸百分比」
+                boot.MarginLeft = Math.Round(boot.MarginLeft / sw * 100.0, 2);
+                boot.MarginRight = Math.Round(boot.MarginRight / sw * 100.0, 2);
+                boot.MarginTop = Math.Round(boot.MarginTop / sh * 100.0, 2);
+                boot.MarginBottom = Math.Round(boot.MarginBottom / sh * 100.0, 2);
+                boot.SettingsVersion = 3;
+                boot.Save();
+            }
+            if (boot.SettingsVersion < 4)
+            {
+                // 只有 v3 是"这些项已是像素值"；v1/v2 根本没有这些项，
+                // 用的是构造函数里的新默认值（已经是百分比），再除一次就毁了。
+                if (boot.SettingsVersion == 3)
+                {
+                    boot.Radius = Math.Round(boot.Radius / sh * 100.0, 2);
+                    boot.DockPadding = Math.Round(boot.DockPadding / sw * 100.0, 2);
+                    boot.ClusterGap = Math.Round(boot.ClusterGap / sw * 100.0, 2);
+                    boot.DockOffsetX = Math.Round(boot.DockOffsetX / sw * 100.0, 2);
+                    boot.DockWidthTrim = Math.Round(boot.DockWidthTrim / sw * 100.0, 2);
+                    boot.FlyoutOffsetX = Math.Round(boot.FlyoutOffsetX / sw * 100.0, 2);
+                }
+                boot.DockShiftX = 0.68;     // 这一项 v4 才有：老配置给个与出厂默认一致的起点
+                boot.SettingsVersion = 4;
+                boot.Save();
+            }
+            if (boot.SettingsVersion < 5)
+            {
+                // v5 起：悬停预览缩略图 / ^ 展开面板 改为「动态跟随 + 残差」。
+                // CalibIconShift 保持 int.MinValue → 首次 Dock 成功时以【当时几何】为基准，
+                // 于是用户此前调好的固定偏移在当下分毫不变，之后图标增减才自动跟随。
+                boot.SettingsVersion = 5;
+                boot.Save();
+            }
+            boot.ClampAll();     // 迁移/读取之后统一裁剪到合法范围
+        }
+
+        /// <summary>
+        /// 把所有百分比字段裁到界面允许的范围。迁移或读取之后统一调一次。
+        /// </summary>
         public void ClampAll()
         {
             Radius = ClampD(Radius, 0, 6);
@@ -432,6 +664,8 @@ namespace Dockify
             ClusterGap = ClampD(ClusterGap, 0, 5);
             DockOffsetX = ClampD(DockOffsetX, -30, 20);
             DockWidthTrim = ClampD(DockWidthTrim, 0, 20);
+            DockShiftX = ClampD(DockShiftX, -25, 25);
+            PreviewOffsetX = ClampD(PreviewOffsetX, -25, 25);
             FlyoutOffsetX = ClampD(FlyoutOffsetX, 0, 50);
             MarginLeft = ClampD(MarginLeft, 0, 20);
             MarginRight = ClampD(MarginRight, 0, 20);
@@ -439,6 +673,9 @@ namespace Dockify
             MarginBottom = ClampD(MarginBottom, 0, 6);
         }
 
+        /// <summary>
+        /// 把数值夹紧到 [lo, hi]。
+        /// </summary>
         private static double ClampD(double v, double lo, double hi)
         {
             if (v < lo) return lo;
@@ -456,27 +693,50 @@ namespace Dockify
 
     // --------------------------------------------------------------- Engine
 
+    /// <summary>
+    /// 核心引擎：每个 Tick 测量一次任务栏 → 算出圆角区域与内容区几何 → 应用。所有 Win32 副作用都收敛在这里。
+    /// </summary>
     internal sealed class TaskbarEngine
     {
         private readonly Dictionary<IntPtr, string> _applied = new Dictionary<IntPtr, string>();
-        private int _trayShift;        // 托盘子窗口被平移了多少像素
+
         private bool _shiftBlocked;    // 平移自检失败，永久放弃平移
         private int _dockCooldown;     // Dock 失败后的冷却节拍数（防止两个模式来回跳）
         // 弹出面板"一步到位"用的 WinEvent 钩子（毫秒级响应，不再等 0.5 秒的心跳）
         private Native.WinEventDelegate _winEventProc;
+        // 托盘弹出面板的 WinEvent 钩子句柄（IntPtr.Zero = 没装上）。
         private IntPtr _winEventHook = IntPtr.Zero;
         private readonly Dictionary<IntPtr, Native.RECT> _hookBase = new Dictionary<IntPtr, Native.RECT>();
         private readonly Dictionary<IntPtr, int> _hookStamp = new Dictionary<IntPtr, int>();
-        private uint _barPid;
+        // 上一次摆位时用的图标组位移。它一变（= 图标增减 / Dock 重新居中）就立刻重摆已开着的弹窗。
+        private int _rowShiftApplied = int.MinValue;
+
+        // ---- 悬停预览：它画在一个全屏 XAML 岛里，没有自己的窗口，只能整体平移那个岛 ----
+        private IntPtr _island;                        // 承载弹窗的岛（缓存）
+        // 最近一次**成功**构建紧凑 Dock 时的内容区平移量。
+        // 悬停预览岛的位移目标必须用它，不能用本拍的 _clusterOk：
+        // 弹窗打开的瞬间本拍会"保持现状"跳过 Dock 构建，那时 _clusterOk=false，
+        // 若据此算成 0 就会把刚摆好的岛又推回去（实测就是这个 bug 导致"二次调整后又偏回去"）。
+        private int _dockRelXSticky;
+        // 「图标组位移」的粘性副本。**这才是弹窗/预览补正需要的量**：
+        // 弹窗打开的那几拍会"保持现状"跳过 Dock 构建，那时 _rowShift 被清成 0，
+        // 直接用它就会把刚摆好的位置又推回去（用户实测的"二次调整后又偏回去"）。
+        private int _rowShiftSticky;
+        // 任务栏所属进程（Explorer）的 PID，用来过滤钩子回调，避免误动别的窗口。
+        private readonly HashSet<uint> _barPids = new HashSet<uint>();   // 所有任务栏所属进程（多屏时不止一个）
         private int _shiftMisses;      // 平移连续没见效的次数
-        private double _lastFactor = 1.0;
-        private readonly Dictionary<IntPtr, Native.RECT> _qsBase = new Dictionary<IntPtr, Native.RECT>();
-        private readonly Dictionary<IntPtr, Native.RECT> _qsLast = new Dictionary<IntPtr, Native.RECT>();
-        private readonly Dictionary<IntPtr, int> _qsFirstTick = new Dictionary<IntPtr, int>();
-        private bool _barVisible;      // 上一轮任务栏是否在屏幕内
+
+private bool _barVisible;      // 上一轮任务栏是否在屏幕内
         private readonly StringBuilder _report = new StringBuilder();
+        // 任务栏是否开了自动隐藏（缓存一轮的结果，避免每次都去查）。
         private bool _autoHide;
+        // 心跳计数：每 Tick 加一。用来节流 —— 区域巡检 5 秒一次、实时诊断 10 拍一次。
         private int _ticks;
+        // 图标组相对「未加 Dock 时自然居中位置」的位移（负数 = 被往左推了）。
+        // 弹出窗口（悬停预览缩略图 / ^ 展开面板）的补正量就由它推导 —— 见 PopupShiftPx。
+        // 每拍开头清零，只有紧凑 Dock 成功那条路径才会写入。
+        private int _rowShift;
+        // GetDpiForMonitor 是否可用。老系统上会失败，失败后一律按 96 DPI 处理。
         private bool _dpiApiOk = true;
         private bool _clusterUsed;     // 动过任务栏内容区（退出时要还原）
         private bool _clusterOk;       // 本轮成功摆出了紧凑 Dock
@@ -486,9 +746,39 @@ namespace Dockify
         private bool _bridgeSized;     // 内容区尺寸这一轮是否已摆好
         private int _bridgeReverts;    // 内容区摆位被系统拽回的连续次数（防死磕）
 
+        // 「视角重心补偿」要右移多少（占显示器宽度百分比）。
+        // 只在设置里勾选了 VisualCenterComp 时生效，默认关闭。
+        private const double VisualCenterBiasPct = 1.32;
+
+
+        // ---- 内部几何常量：都是「未缩放的像素」，用时经 Scale(x, factor) 按 DPI 放大 ----
+        private const int MinClusterWidthPx = 60;      // 图标组最小宽度（防止算出 0 宽）
+        private const int MinDockWidthPx = 300;        // 紧凑 Dock 允许的最小宽度
+        private const int MaxWidthReservePx = 60;      // 硬上限：内容区最多到 cw − 这个值（绝不能等于整条任务栏宽）
+        private const int EdgeInsetPx = 10;            // 区域右边界收进内容里侧的量（这样右侧圆角才看得见）
+        private const int TrayFallbackWidthPx = 240;   // 量不到托盘窗口时的兜底宽度
+        private const int IconLeftGuardPx = 40;        // 平移时图标左端距屏幕边缘至少留这么多
+        private const int ShowDesktopStripPx = 30;     // 「显示桌面」细条的宽度阈值（不算图标）
+        private const double BackgroundWidthRatio = 0.9; // 宽过任务栏这个比例的容器 = 背景，不是按钮
+
+        // ---- 自动居中的自检参数 ----
+        private const int ShiftEpsilonPx = 3;          // 位移小于这个值就别动，免得抖
+        private const int ShiftAbandonPx = 150;        // 自检：整块中心还差这么远 → 认为平移没生效
+        private const int ShiftMissLimit = 3;          // 连续几次没生效就永久放弃自动居中
+
+        // ---- 节奏（单位：心跳拍数，一拍 = 500ms）----
+        private const int RegionCheckEveryTicks = 10;  // 每 10 拍（5 秒）巡检一次区域是否被系统清掉
+        private const int LiveDiagEveryTicks = 10;     // 每 10 拍写一次实时诊断
+        private const int DockRetryCooldownTicks = 20; // 模式判定失败后的冷却（10 秒），避免两种模式每拍互切
+
+        // ---- 托盘弹出面板跟随 ----
+        private const int FlyoutCorrectionWindowMs = 3000; // 只在这段时间内纠偏，之后交给 Explorer
+        private const int FlyoutMaxTracked = 32;           // 记录表上限，超过就清理
+
         public Settings Settings;
 
         public string Status;
+        /// <summary>本拍成功套用区域的任务栏个数（0 = 一个都没成，通常意味着权限不够）。</summary>
         public int AppliedBars;
         public int TaskbarsFound;      // 本轮枚举到几个任务栏（0 = 进程上下文受限，什么都看不到）
 
@@ -538,6 +828,9 @@ namespace Dockify
             return list;
         }
 
+        /// <summary>
+        /// 问系统：任务栏当前是否开启了自动隐藏。
+        /// </summary>
         private static bool QueryAutoHide()
         {
             // 注册表最准：StuckRects3 的 Settings 字节数组，byte[8] 的 bit0 = 自动隐藏
@@ -571,6 +864,9 @@ namespace Dockify
             catch { return false; }
         }
 
+        /// <summary>
+        /// 取某个窗口所在显示器的 DPI（用于把内部常量按缩放放大）。
+        /// </summary>
         private int DpiFor(IntPtr hWnd)
         {
             if (_dpiApiOk)
@@ -595,10 +891,28 @@ namespace Dockify
         }
 
         // 百分比 → 像素（横向按屏幕宽度，纵向按屏幕高度）
+        /// <summary>
+        /// 百分比 → 像素（**横向**按显示器宽度换算）。
+        /// </summary>
+        /// <summary>
+        /// 百分比 → 像素（非负保护：0 或负值一律返回 0）。
+        /// </summary>
         private static int PctW(double pct, Native.RECT mon) { return Pct(pct, mon.Right - mon.Left); }
+        /// <summary>
+        /// 百分比 → 像素（**纵向**按显示器高度换算）。
+        /// </summary>
         private static int PctH(double pct, Native.RECT mon) { return Pct(pct, mon.Bottom - mon.Top); }
 
         // 带符号的百分比 → 像素（左侧裁切微调会取负值，不能走 Pct 的非负保护）
+        /// <summary>
+        /// 带符号的百分比 → 像素。左侧裁切微调会取负值，不能走 Pct 的非负保护。
+        /// </summary>
+        /// <param name="pct">百分比（负值按 0 处理）。</param>
+        /// <param name="baseSize">基准尺寸（物理像素）。</param>
+        /// <returns>对应的物理像素。</returns>
+        /// <param name="pct">百分比，允许为负。</param>
+        /// <param name="baseSize">基准尺寸（显示器宽或高，物理像素）。</param>
+        /// <returns>对应的物理像素，保留符号。</returns>
         private static int PctSigned(double pct, int baseSize)
         {
             return (int)Math.Round(pct / 100.0 * baseSize, MidpointRounding.AwayFromZero);
@@ -612,6 +926,12 @@ namespace Dockify
             return r < 0 ? 0 : r;
         }
 
+        /// <summary>
+        /// 按 DPI 缩放一个非负像素常量（内部阈值用，非用户设置）。
+        /// </summary>
+        /// <param name="value">未缩放的像素常量（负值按 0 处理）。</param>
+        /// <param name="factor">DPI 缩放系数。</param>
+        /// <returns>缩放后的物理像素，至少为 1。</returns>
         private static int Scale(int value, double factor)
         {
             if (value <= 0) return 0;
@@ -620,6 +940,16 @@ namespace Dockify
         }
 
         // 给单个任务栏套上圆角矩形区域；返回是否成功（每一步都记进 _report，方便 --diag 排查）
+        /// <summary>
+        /// 给任务栏套上圆角矩形区域。每一步都写进 _report，失败时保留系统原状。
+        /// </summary>
+        /// <param name="hWnd">任务栏窗口句柄。</param>
+        /// <param name="marginLeft">左边裁掉多少物理像素。</param>
+        /// <param name="marginRight">右边裁掉多少物理像素。</param>
+        /// <param name="marginTop">上边裁掉多少物理像素。</param>
+        /// <param name="marginBottom">下边裁掉多少物理像素。</param>
+        /// <param name="radius">圆角半径（物理像素）。</param>
+        /// <returns>true = 区域已成功套上；false = 系统拒绝（常见原因：本进程权限低于任务栏）。</returns>
         private bool ApplyRegion(IntPtr hWnd, int marginLeft, int marginRight, int marginTop, int marginBottom, int radius)
         {
             Native.RECT r;
@@ -674,6 +1004,9 @@ namespace Dockify
         // ================= 弹出面板"一步到位" =================
         // 以前是在 0.5 秒的心跳里摆位置 → 面板先出现在 Explorer 给的位置，下一拍才被挪走，
         // 视觉上就是"二次移动"。现在用 WinEvent 钩子：面板一 show / 一被移动，立刻摆好（毫秒级）。
+        /// <summary>
+        /// 装 WinEvent 钩子：托盘弹出面板一出现就摆位（毫秒级，避免「先弹错位置再跳一下」）。
+        /// </summary>
         public void InstallFlyoutHook()
         {
             if (_winEventHook != IntPtr.Zero) return;
@@ -683,10 +1016,15 @@ namespace Dockify
                 _winEventHook = Native.SetWinEventHook(Native.EVENT_OBJECT_SHOW, Native.EVENT_OBJECT_LOCATIONCHANGE,
                     IntPtr.Zero, _winEventProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
                 _report.AppendLine("  WinEvent 钩子 = " + _winEventHook);
+                if (_winEventHook == IntPtr.Zero)
+                    _report.AppendLine("  ! SetWinEventHook 失败 → 弹出面板跟随不可用（受限上下文常见）");
             }
             catch { }
         }
 
+        /// <summary>
+        /// 卸载钩子并释放回调委托（防止 GC 回收导致回调失效）。
+        /// </summary>
         public void RemoveFlyoutHook()
         {
             try
@@ -696,18 +1034,72 @@ namespace Dockify
             catch { }
         }
 
-        // 按类名决定用哪个设置值：^ 隐藏图标面板 与 快捷设置（网络/音量/电池）各一个
-        private double FlyoutOffsetFor(IntPtr hwnd)
+        // 悬停预览缩略图的尺寸上限。Win11 里"预览"和"快捷设置"都用 Xaml_WindowedPopupClass，
+        // 快捷设置约 480 高、明显更"高"，所以用高度把它们区分开：矮的 = 预览（跟随），高的 = 不碰。
+        private const int PreviewMaxHeightPx = 320;
+        private const int PreviewMaxWidthPx = 1600;
+        // 【实测结论 2026-10-08】Win11 的"悬停窗口预览"**没有独立窗口**：它画在一个全屏
+        // 1920x1080 的 XAML 岛（XamlExplorerHostIslandWindow）里，位置由 Explorer 自己的
+        // XAML 布局算。所以"移动预览小窗"这条路不存在 —— 下面的类名匹配只对老系统
+        // （TaskListThumbnailWnd 时代）有效，新系统上不会命中，属预期行为。
+        // 预览偏位的真正来源见 README「已知限制」里的"图标组平移"那条。
+
+        /// <summary>
+        /// 这个弹出窗口要往左挪多少像素（**正数 = 往左**，可为负）；0 = 不用管。
+        /// 组成：动态跟随量 + 用户微调残差。
+        ///   · 动态量 = −(当前图标组位移 − 校准时位移)：这些窗口由 Explorer 按【未加 Dock 的原始布局】
+        ///     定位，图标数量一变 Dock 几何就变，位移差多少就补多少 —— 这就是"实时对齐"。
+        ///   · 残差 = 设置里的 ^面板微调 / 悬停预览微调（% 屏宽，正 = 往左），是用户在动态量之上做的微调。
+        /// </summary>
+        /// <param name="hwnd">WinEvent 回调里拿到的窗口句柄。</param>
+        /// <param name="isPreview">出参：true = 这是悬停预览缩略图。</param>
+        /// <returns>要左移的像素数；0 = 不处理这个窗口。</returns>
+        private int PopupShiftPx(IntPtr hwnd, out bool isPreview)
         {
+            isPreview = false;
             StringBuilder sb = new StringBuilder(160);
             Native.GetClassName(hwnd, sb, sb.Capacity);
             string cls = sb.ToString();
-            if (cls == "TopLevelWindowForOverflowXamlIsland" || cls == "NotifyIconOverflowWindow")
-                return Settings.FlyoutOffsetX;          // ^ 隐藏图标面板
-            // 网络/音量/电池 的快捷设置面板：按用户要求**不再移动**（Explorer 自己锚定得没问题）
-            return 0;
+
+            bool isTrayPopup = (cls == "TopLevelWindowForOverflowXamlIsland" || cls == "NotifyIconOverflowWindow");
+            if (!isTrayPopup)
+            {
+                if (cls == "TaskListThumbnailWnd")
+                {
+                    isPreview = true;
+                }
+                else if (cls == "Xaml_WindowedPopupClass")
+                {
+                    Native.RECT pr;
+                    if (!Native.GetWindowRect(hwnd, out pr)) return 0;
+                    if ((pr.Bottom - pr.Top) <= PreviewMaxHeightPx) isPreview = true;   // 矮 → 预览；高 → 快捷设置
+                }
+                if (!isPreview) return 0;
+                // 网络/音量/电池 的快捷设置面板按用户要求**不再移动**（Explorer 自己锚定得没问题）
+                if (!Settings.PreviewFollow) return 0;              // 关掉跟随时预览完全不动
+            }
+            else if (!Settings.FlyoutFollow)
+            {
+                return PctSigned(Settings.FlyoutOffsetX, MonitorRect(hwnd).Right - MonitorRect(hwnd).Left);
+            }
+
+            int monW = MonitorRect(hwnd).Right - MonitorRect(hwnd).Left;
+            int residual = PctSigned(isPreview ? Settings.PreviewOffsetX : Settings.FlyoutOffsetX, monW);
+            // 动态补正 = **−图标组位移（绝对量）**。
+            // 实测（2026-10-08）：这些窗口由 Explorer 按"图标没被 Dock 平移过"的位置摆放，
+            // 要把图标被推走的那一整段补回来；用户当年手调的 7.58%(≈146px) 就是这个量（当时 rowShift≈−144）。
+            // 不能用"相对校准"：那样在校准状态下动态项会归零，反而把该补的量抵消掉（踩过）。
+            int followPx = -_rowShiftSticky;
+            if (isPreview && !Settings.PreviewFollow) followPx = 0;
+
+            long total = (long)residual + followPx;
+            if (Math.Abs(total) > 4000) return residual;            // 安全阀：算出离谱值就退回只用残差
+            return (int)total;
         }
 
+        /// <summary>
+        /// 钩子回调：把 ^ 面板一步摆到托盘左侧（同一面板只纠偏一小段时间，避免和 Explorer 抢位置）。
+        /// </summary>
         private void OnFlyoutEvent(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild,
                                    uint dwEventThread, uint dwmsEventTime)
         {
@@ -716,22 +1108,50 @@ namespace Dockify
                 if (hwnd == IntPtr.Zero || idObject != 0) return;      // 只要窗口本身的事件
                 if (ev != Native.EVENT_OBJECT_SHOW && ev != Native.EVENT_OBJECT_LOCATIONCHANGE) return;
 
-                double off = FlyoutOffsetFor(hwnd);
-                if (off <= 0) return;
+                // 【预览岛】Explorer 在弹窗动画 / 关闭 / 重排时会自己挪这个岛 → 立刻把偏移补回来。
+                // 这就是"二次调整正常、短时间后又偏回去、且第二次不再调整"的根治：
+                // 以前靠"记录过一次就不再检查"，被挪回去后再也纠不回来。
+                if (IsFlyoutIsland(hwnd))
+                {
+                    // 预览岛的位移目标 = 「图标组位移」的粘性副本，**不依赖本拍 _clusterOk**：
+                    // 弹窗打开时本拍会跳过 Dock 构建，那时 _clusterOk=false，据此归零就会把岛推回去。
+                    // 只有"关掉程序"或"切到裁两端"才真正归零。
+                    if (!Settings.Enabled || !Settings.IsDock) { _dockRelXSticky = 0; _rowShiftSticky = 0; }
+                    FollowPreviewIsland(Settings.Enabled && Settings.IsDock ? _rowShiftSticky : 0);
+                    return;
+                }
+
+                bool isPreview;
+                int shift = PopupShiftPx(hwnd, out isPreview);      // 正数 = 往左挪
+                if (shift == 0) return;
 
                 uint pid;
                 Native.GetWindowThreadProcessId(hwnd, out pid);
-                if (pid != _barPid) return;                            // 只认 explorer 自己的窗口
+                if (!_barPids.Contains(pid)) return;                    // 只认任务栏所属进程的窗口
 
                 Native.RECT cur;
                 if (!Native.GetWindowRect(hwnd, out cur)) return;
                 int w = cur.Right - cur.Left;
                 int ht = cur.Bottom - cur.Top;
                 if (w < 120 || ht < 80) return;                        // 提示/菜单不要
-                if (w > 900 || ht > 1100) return;                      // 太大的不是托盘面板
+                if (isPreview)
+                {
+                    if (w > PreviewMaxWidthPx || ht > PreviewMaxHeightPx) return;   // 预览不会太大
+                }
+                else if (w > 900 || ht > 1100) return;                 // 太大的不是托盘面板
 
                 if (ev == Native.EVENT_OBJECT_SHOW)
                 {
+                    // 悬停预览会频繁开关 → 登记表要定期清理，避免常驻进程里无界增长。
+                    // 超过 12 秒没动静的条目直接丢弃；条目仍然过多就整表清空兜底。
+                    if (_hookBase.Count > FlyoutMaxTracked)
+                    {
+                        List<IntPtr> dead = new List<IntPtr>();
+                        foreach (KeyValuePair<IntPtr, int> kv in _hookStamp)
+                            if (unchecked(Environment.TickCount - kv.Value) > FlyoutCorrectionWindowMs * 4) dead.Add(kv.Key);
+                        for (int gi = 0; gi < dead.Count; gi++) { _hookBase.Remove(dead[gi]); _hookStamp.Remove(dead[gi]); }
+                        if (_hookBase.Count > FlyoutMaxTracked) { _hookBase.Clear(); _hookStamp.Clear(); }
+                    }
                     _hookBase[hwnd] = cur;                              // 记下 Explorer 给它的位置
                     _hookStamp[hwnd] = Environment.TickCount;
                 }
@@ -739,17 +1159,233 @@ namespace Dockify
                 if (!_hookBase.TryGetValue(hwnd, out b)) return;
                 int stamp;
                 if (!_hookStamp.TryGetValue(hwnd, out stamp)) return;
-                if (unchecked(Environment.TickCount - stamp) > 3000) return;   // 只在一开始那 3 秒内摆位
+                if (unchecked(Environment.TickCount - stamp) > FlyoutCorrectionWindowMs) return;   // 只在一开始那 3 秒内摆位
 
-                int tx = b.Left - PctW(off, MonitorRect(hwnd));
+                int tx = b.Left - shift;
                 if (Math.Abs(cur.Left - tx) <= 2) return;
                 Native.MoveWindow(hwnd, tx, cur.Top, w, ht, true);
             }
             catch { }
         }
+        /// <summary>图标组相对自然居中位置的当前位移（弹出窗口跟随用；未 Dock 时为 0）。</summary>
+        public int RowShift { get { return _rowShift; } }
+
+        /// <summary>
+        /// 图标数量变化会让 Dock 几何变化 → **已经开着的弹出窗口要立刻跟着挪**（不用等下一拍）。
+        /// 只动我们登记过、且仍然可见的窗口；窗口已关掉就把记录清掉（顺便防止字典无界增长）。
+        /// </summary>
+        private void RepositionTrackedPopups()
+        {
+            if (_hookBase.Count == 0) return;
+            List<IntPtr> gone = new List<IntPtr>();
+            foreach (KeyValuePair<IntPtr, Native.RECT> kv in _hookBase)
+            {
+                IntPtr h = kv.Key;
+                if (!Native.IsWindow(h) || !Native.IsWindowVisible(h)) { gone.Add(h); continue; }
+                bool isPreview;
+                int shift = PopupShiftPx(h, out isPreview);
+                if (shift == 0) continue;
+                Native.RECT cur;
+                if (!Native.GetWindowRect(h, out cur)) continue;
+                int tx = kv.Value.Left - shift;          // 基准位置 − 位移，避免逐次累加漂移
+                if (Math.Abs(cur.Left - tx) <= 2) continue;
+                Native.MoveWindow(h, tx, cur.Top, cur.Right - cur.Left, cur.Bottom - cur.Top, true);
+            }
+            for (int gi = 0; gi < gone.Count; gi++) { _hookBase.Remove(gone[gi]); _hookStamp.Remove(gone[gi]); }
+        }
+
+        /// <summary>
+        /// 找到承载任务栏弹窗的那个**全屏 XAML 岛**（XamlExplorerHostIslandWindow）。
+        /// 注意：Alt-Tab 的"任务切换"岛类名相同但标题非空、且不可见，要排除掉。
+        /// </summary>
+        /// <summary>
+        /// 这个句柄是不是"承载任务栏弹窗的全屏 XAML 岛"。
+        /// 用途：钩子收到它的移动事件就立刻把偏移补回来（Explorer 会自己挪它）。
+        /// </summary>
+        private bool IsFlyoutIsland(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (_island != IntPtr.Zero && hwnd == _island) return true;
+            StringBuilder sb = new StringBuilder(160);
+            Native.GetClassName(hwnd, sb, sb.Capacity);
+            if (sb.ToString() != "XamlExplorerHostIslandWindow") return false;
+            StringBuilder tt = new StringBuilder(64);
+            Native.GetWindowText(hwnd, tt, tt.Capacity);
+            if (tt.Length != 0) return false;                     // "任务切换"岛不算
+            Native.RECT r;
+            if (!Native.GetWindowRect(hwnd, out r)) return false;
+            if ((r.Right - r.Left) < 800) return false;
+            _island = hwnd;
+            return true;
+        }
+
+        private IntPtr FindFlyoutIsland()
+        {
+            if (_island != IntPtr.Zero && Native.IsWindow(_island)) return _island;
+            IntPtr found = IntPtr.Zero;
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Native.IsWindowVisible(h)) return true;
+                StringBuilder sb = new StringBuilder(160);
+                Native.GetClassName(h, sb, sb.Capacity);
+                if (sb.ToString() != "XamlExplorerHostIslandWindow") return true;
+                uint pid;
+                Native.GetWindowThreadProcessId(h, out pid);
+                if (!_barPids.Contains(pid)) return true;
+                StringBuilder tt = new StringBuilder(64);
+                Native.GetWindowText(h, tt, tt.Capacity);
+                if (tt.Length != 0) return true;                 // "任务切换"岛
+                Native.RECT r;
+                if (!Native.GetWindowRect(h, out r)) return true;
+                if ((r.Right - r.Left) < 800) return true;       // 不是全屏那个
+                found = h;
+                return false;
+            }, IntPtr.Zero);
+            _island = found;
+            return found;
+        }
+
+        /// <summary>
+        /// 把悬停预览岛放回自然位置（静态版：--reset 与退出时用，不能依赖实例状态）。
+        /// </summary>
+        private static void RestoreIslandToNatural()
+        {
+            try
+            {
+                IntPtr found = IntPtr.Zero;
+                Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+                {
+                    if (!Native.IsWindowVisible(h)) return true;
+                    StringBuilder sb = new StringBuilder(160);
+                    Native.GetClassName(h, sb, sb.Capacity);
+                    if (sb.ToString() != "XamlExplorerHostIslandWindow") return true;
+                    StringBuilder tt = new StringBuilder(64);
+                    Native.GetWindowText(h, tt, tt.Capacity);
+                    if (tt.Length != 0) return true;
+                    Native.RECT r;
+                    if (!Native.GetWindowRect(h, out r)) return true;
+                    if ((r.Right - r.Left) < 800) return true;
+                    found = h;
+                    return false;
+                }, IntPtr.Zero);
+                if (found == IntPtr.Zero) return;
+                Native.RECT fr;
+                if (!Native.GetWindowRect(found, out fr)) return;
+                int monL = MonitorRect(found).Left;
+                if (Math.Abs(fr.Left - monL) <= 2) return;          // 已在自然位置
+                Native.MoveWindow(found, monL, fr.Top, fr.Right - fr.Left, fr.Bottom - fr.Top, true);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 让「鼠标悬停程序图标时的窗口预览」重新对上图标。
+        /// 原理（2026-10-08 实测）：预览没有自己的窗口，它画在上面那个全屏 XAML 岛里，
+        /// 而 Explorer 给预览定位用的是"图标**没被 Dock 平移过**"的位置。
+        /// 但**移动这个岛，岛里的预览会 1:1 跟着走**（实测：岛左移 144px → 预览中心 958 → 812，误差 2px 内）。
+        /// 所以我们把岛也平移同样的量（= 内容区平移量 _bridgeRelX），预览就回到图标正上方；
+        /// 关掉「预览动态跟随」时把岛放回自然位置。
+        /// </summary>
+        /// <param name="wantX">相对自然位置的位移（与 _bridgeRelX 同向同量）。</param>
+        private void FollowPreviewIsland(int wantX)
+        {
+            if (!Settings.PreviewFollow) wantX = 0;              // 关掉跟随 → 岛回自然位置
+            IntPtr isl = FindFlyoutIsland();
+            if (isl == IntPtr.Zero) return;
+            Native.RECT r;
+            if (!Native.GetWindowRect(isl, out r)) return;
+            // 自然位置 = 所在显示器的左边界（全屏岛本来就贴齐显示器，副屏也适用）
+            Native.RECT mon = MonitorRect(isl);
+            int target = mon.Left + wantX;
+            if (wantX != 0)
+                target -= PctSigned(Settings.PreviewOffsetX, mon.Right - mon.Left);   // 用户残差（正 = 再往左）
+            // 【关键】每次都核对**实际位置**，绝不因为"记录过一次"就跳过：
+            // Explorer 会在弹窗动画/关闭/重排时把岛挪回原位，只有持续核对才能把它按住。
+            if (Math.Abs(r.Left - target) <= 2) return;
+            int w = r.Right - r.Left, ht = r.Bottom - r.Top;
+            if (!Native.MoveWindow(isl, target, r.Top, w, ht, true))
+            {
+                _report.AppendLine("  ! 预览岛跟随失败, err=" + Marshal.GetLastWin32Error());
+                return;
+            }
+            _report.AppendLine("  预览岛跟随 → 目标位移 " + wantX + "px（x " + r.Left + " → " + target + "）");
+        }
+
+        /// <summary>
+        /// 把「当前几何」记为弹出窗口的校准基准。用户在设置里调好偏移并点确定时调用，
+        /// 于是动态跟随项归零、只保留用户调出来的那个偏移量。
+        /// </summary>
+        public void RecalibratePopups()
+        {
+            Settings.CalibIconShift = _rowShift;
+            Settings.Save();
+        }
+
+        /// <summary>
+        /// 把"预览岛 / ^ 面板"的对正数据写到 %APPDATA%\Dockify\align.txt。
+        /// 用途：① 排障时用户发这份数据；② 自动化测试直接读（不用截图）。
+        /// </summary>
+        public void MeasurePopupAlignment()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("Dockify 弹窗/预览对正测量  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("版本     : " + Application.ProductVersion);
+            sb.AppendLine("当前     : " + Status);
+            sb.AppendLine("_rowShift      = " + _rowShift + "   _rowShiftSticky = " + _rowShiftSticky + "   （预览岛应平移的量）");
+            sb.AppendLine("_dockRelXSticky = " + _dockRelXSticky + "   （旧法用的量，已弃用）");
+
+            // 找预览岛：报告它的实际 x 与"应有 x"（自然位置 + rowShift）
+            IntPtr isl = FindFlyoutIsland();
+            if (isl == IntPtr.Zero)
+            {
+                sb.AppendLine("预览岛   : 未找到（此刻可能没悬停 → 正常；悬停一个图标后再点本项）");
+            }
+            else
+            {
+                Native.RECT ir;
+                if (Native.GetWindowRect(isl, out ir))
+                {
+                    Native.RECT mon = MonitorRect(isl);
+                    int want = mon.Left + _rowShiftSticky;
+                    sb.AppendLine("预览岛   : x=" + ir.Left + "  （自然=" + mon.Left + "，应有=" + want + "，偏差=" + (ir.Left - want) + "px）");
+                }
+            }
+
+            // 枚举所有弹窗（^ 面板 / 预览岛 / 其它），连同它们的矩形一并写出
+            sb.AppendLine("--- 当前可见的弹窗/岛窗口 ---");
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Native.IsWindowVisible(h)) return true;
+                StringBuilder cls = new StringBuilder(160);
+                Native.GetClassName(h, cls, cls.Capacity);
+                string c = cls.ToString();
+                if (c.IndexOf("Overflow", StringComparison.Ordinal) < 0 &&
+                    c.IndexOf("XamlExplorerHostIsland", StringComparison.Ordinal) < 0 &&
+                    c.IndexOf("NotifyIconOverflow", StringComparison.Ordinal) < 0)
+                    return true;
+                Native.RECT r;
+                if (!Native.GetWindowRect(h, out r)) return true;
+                sb.AppendLine("  [" + c + "]  " + r.Left + "," + r.Top + "-" + r.Right + "," + r.Bottom +
+                              "  宽" + (r.Right - r.Left) + " 高" + (r.Bottom - r.Top));
+                return true;
+            }, IntPtr.Zero);
+
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Dockify");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "align.txt"), sb.ToString(), new System.Text.UTF8Encoding(false));
+            }
+            catch { }
+            System.Media.SystemSounds.Asterisk.Play();   // 给个提示音：写好了
+        }
+
         // 托盘弹出面板（快捷设置 / 隐藏图标面板）当前是否开着。
         // 面板开着的时候必须**暂停自动适应**：面板出现/消失会让测量值抖动，
         // 一补偿整组就会带着任务栏来回跳。
+        /// <summary>
+        /// 托盘弹出面板是否开着。开着就暂停自动适应，否则任务栏会一直跳。
+        /// </summary>
         private bool AnyTrayFlyoutVisible(IntPtr barHwnd)
         {
             uint barPid;
@@ -781,6 +1417,10 @@ namespace Dockify
             }, IntPtr.Zero);
             return found;
         }
+        /// <summary>
+        /// 清掉窗口区域，恢复成完整矩形。
+        /// </summary>
+        // ================= 区域与还原 =================
         private static void ClearRegion(IntPtr hWnd)
         {
             if (!Native.IsWindow(hWnd)) return;
@@ -788,8 +1428,13 @@ namespace Dockify
         }
 
         // 把所有任务栏恢复原样（供 --reset 和退出时调用，不依赖任何状态）
+        /// <summary>
+        /// 一键还原：内容区回整屏宽、托盘回最右、区域清空，并通知 Explorer 重排。
+        /// </summary>
         public static void ResetTaskbars()
         {
+            // 悬停预览岛也放回自然位置（--reset / 退出时不能留偏移）
+            RestoreIslandToNatural();
             List<IntPtr> bars = FindTaskbars(false);
             for (int i = 0; i < bars.Count; i++)
             {
@@ -800,6 +1445,9 @@ namespace Dockify
         }
 
         // 把一个任务栏强行还原成整屏宽（用于「程序被强杀后任务栏卡在 Dock 短条」的救急）
+        /// <summary>
+        /// 把任务栏的内容区与托盘位置还原成系统自然状态（不改窗口本身）。
+        /// </summary>
         private static void ForceFullWidth(IntPtr h)
         {
             Native.RECT mon = MonitorRect(h);
@@ -817,6 +1465,9 @@ namespace Dockify
             Native.MoveWindow(h, mon.Left, y, monW, barH, true);
         }
 
+        /// <summary>
+        /// 清掉「已套用」记录。停用、自动隐藏、退出时都要清。
+        /// </summary>
         private void ResetApplied()
         {
             foreach (KeyValuePair<IntPtr, string> kv in _applied)
@@ -825,21 +1476,32 @@ namespace Dockify
                 ClearRegion(kv.Key);
             }
             _applied.Clear();
+            _dockRelXSticky = 0;
+            _rowShiftSticky = 0;      // 停用/还原时预览岛也归零
             RestoreCluster();               // 紧凑 Dock 动过的子窗口放回原位
             AppliedBars = 0;
         }
 
+        /// <summary>
+        /// 停用并立刻还原任务栏。
+        /// </summary>
         public void Reset()
         {
             ResetApplied();
+            RestoreIslandToNatural();     // 悬停预览岛也要放回自然位置，别把偏移留在系统里
             Status = "已恢复任务栏原样";
         }
 
         // 每次「节拍」跑一遍：发现任务栏几何 / 设置变化就重新套区域
+        /// <summary>
+        /// 一次心跳（默认 500ms）：枚举任务栏 → 逐个决定用哪种模式 → 应用。所有异常都在这里兜住。
+        /// </summary>
+        // ================= 心跳：一次完整的测量 → 应用 =================
         public void Tick()
         {
             _ticks++;
-            bool force = (_ticks % 2 == 0);   // 每 1 秒强制重刷一次，防止被系统改回去
+            bool force = false;
+            _rowShift = 0;      // 只有紧凑 Dock 成功时才重新写入
 
             _report.Length = 0;
             _report.AppendLine("时间     : " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
@@ -864,7 +1526,14 @@ namespace Dockify
             TaskbarsFound = bars.Count;
             _report.AppendLine("任务栏   : 找到 " + bars.Count + " 个");
             _clusterOk = false;
-            if (bars.Count > 0) Native.GetWindowThreadProcessId(bars[0], out _barPid);
+            // 多显示器：把所有任务栏的进程都记下来（原来只记 bars[0]，副屏的弹出面板会被判成"外人"）
+            _barPids.Clear();
+            for (int bi = 0; bi < bars.Count; bi++)
+            {
+                uint bp;
+                Native.GetWindowThreadProcessId(bars[bi], out bp);
+                _barPids.Add(bp);
+            }
 
             for (int i = 0; i < bars.Count; i++)
             {
@@ -878,6 +1547,8 @@ namespace Dockify
             if (bars.Count == 0)
             {
                 _applied.Clear();
+            _dockRelXSticky = 0;
+            _rowShiftSticky = 0;      // 停用/还原时预览岛也归零
                 AppliedBars = 0;
                 Status = "未找到任务栏（进程看不到任务栏：多半是启动上下文受限）";
                 _report.AppendLine("结果     : 没枚举到任务栏窗口");
@@ -913,6 +1584,16 @@ namespace Dockify
                 IntPtr h = bars[i];
                 Native.RECT r;
                 if (!Native.GetWindowRect(h, out r)) continue;
+                // 巡检：每 5 秒检查一次区域是否被系统清掉（原来每 1 秒无条件重刷，导致 Explorer 持续重绘）
+                if (!force && _ticks % RegionCheckEveryTicks == 0)
+                {
+                    Native.RECT rgnBox;
+                    if (Native.GetWindowRgnBox(h, out rgnBox) == 0)
+                    {
+                        force = true;
+                        _report.AppendLine("  巡检：区域被系统清掉了 → 重新套用");
+                    }
+                }
 
                 // 任务栏刚被唤出（从隐藏变回可见）→ 立刻重刷一次，别等心跳
                 Native.RECT monNow = MonitorRect(h);
@@ -926,9 +1607,8 @@ namespace Dockify
 
                 int dpi = Settings.ScaleWithDpi ? DpiFor(h) : 96;
                 double factor = Settings.ScaleWithDpi ? (dpi / 96.0) : 1.0;
-                _lastFactor = factor;
 
-                // 紧凑 Dock：把开始按钮 / 任务按钮 / 托盘三个子窗口重排成一个居中的紧凑簇，
+// 紧凑 Dock：把开始按钮 / 任务按钮 / 托盘三个子窗口重排成一个居中的紧凑簇，
                 // 任务栏窗口本身不动（所以自动隐藏照常工作，不会和 Explorer 打架）
                 bool compact = false;
                 int pillLeft = 0, pillRight = 0;
@@ -937,7 +1617,7 @@ namespace Dockify
                     compact = BuildCompactDock(h, factor, r, out pillLeft, out pillRight);
                     if (!compact)
                     {
-                        _dockCooldown = 20;        // 失败就冷却 10 秒，绝不让两个模式每拍互切
+                        _dockCooldown = DockRetryCooldownTicks;        // 失败就冷却 10 秒，绝不让两个模式每拍互切
                         _report.AppendLine("  Dock 本轮失败 → 冷却 20 拍（10 秒）");
                     }
                     if (compact && pillLeft < 0)
@@ -1001,17 +1681,35 @@ namespace Dockify
                 }
             }
 
-
             AppliedBars = ok;
             if (ok == 0) Status = "裁切失败：被拒绝访问（err=5）";
             else if (_clusterBlocked) Status = "紧凑 Dock 摆位被系统驳回，已退回裁两端";
             else if (Settings.IsDock && !_clusterOk) Status = "没找到任务栏子窗口，已按裁两端处理";
             else Status = "已应用 · " + Settings.Describe();
+            // 图标增减 → Dock 几何变了就立刻重摆已开着的弹窗（悬停预览 / ^ 展开面板），
+            // 这就是"新增图标时动态调整偏移"和"托盘展开界面实时调整"的落点。
+            if (_rowShift != _rowShiftApplied)
+            {
+                _rowShiftApplied = _rowShift;
+                RepositionTrackedPopups();
+            }
+
+            // 悬停预览：把承载它的全屏 XAML 岛平移同样的量（用「图标组位移」，不是内容区绝对 x）
+            // 预览岛的位移目标 = 「图标组位移」的粘性副本，**不依赖本拍 _clusterOk**：
+            // 弹窗打开时本拍会跳过 Dock 构建，那时 _clusterOk=false，据此归零就会把岛推回去。
+            // 只有"关掉程序"或"切到裁两端"才真正归零。
+            if (!Settings.Enabled || !Settings.IsDock) { _dockRelXSticky = 0; _rowShiftSticky = 0; }
+            FollowPreviewIsland(_rowShiftSticky);
+
             _report.AppendLine("结果     : 成功 " + ok + " / " + bars.Count + " 个任务栏");
-            if (_ticks % 10 == 0 && _report.ToString().IndexOf("屏幕外") < 0) Program.WriteLiveDiag(this);
+            if (_ticks % LiveDiagEveryTicks == 0) Program.WriteLiveDiag(this);   // 每 10 拍写一次实时诊断
         }
 
         // 在任务栏的子窗口里按类名找一个窗口
+        /// <summary>
+        /// 按类名找直接子窗口（内容区 / 托盘都靠它定位）。
+        /// </summary>
+        // ================= 测量：找出图标组与托盘的真实位置 =================
         private static IntPtr FindChildByClass(IntPtr parent, string cls)
         {
             IntPtr c = Native.GetWindow(parent, Native.GW_CHILD);
@@ -1034,6 +1732,16 @@ namespace Dockify
 
         // 用 UI Automation 问 Windows：任务栏上「程序图标区」和「系统托盘区」分别在屏幕什么位置。
         // 重要：任务栏被自动隐藏（滑出屏幕）时，UIA 里根本没有这些按钮 —— 所以必须先确认任务栏是「唤出」状态。
+        /// <summary>
+        /// 用 UI Automation 量出图标组与托盘的屏幕位置。任务栏没唤出时返回 false（不猜）。
+        /// </summary>
+        /// <param name="barHwnd">任务栏窗口句柄（UIA 从这里往下找按钮）。</param>
+        /// <param name="barRect">任务栏窗口矩形，用来把屏幕坐标换算成相对坐标并过滤干扰元素。</param>
+        /// <param name="iconL">出参：程序图标组左端（屏幕坐标）。</param>
+        /// <param name="iconR">出参：程序图标组右端。</param>
+        /// <param name="trayL">出参：系统托盘左端。</param>
+        /// <param name="trayR">出参：系统托盘右端。</param>
+        /// <returns>false = 任务栏没唤出（UIA 返回空树）或按钮太少，调用方必须保持现状、不要乱猜。</returns>
         private bool MeasureContent(IntPtr barHwnd, Native.RECT barRect,
                                     out int iconL, out int iconR, out int trayL, out int trayR)
         {
@@ -1043,8 +1751,13 @@ namespace Dockify
                 AutomationElement root = AutomationElement.RootElement;
                 if (root == null) return false;
 
-                Condition cond = new PropertyCondition(AutomationElement.ClassNameProperty, "Shell_TrayWnd");
-                AutomationElement bar = root.FindFirst(TreeScope.Children, cond);
+                // 【多显示器关键点】直接取**这个句柄**对应的 UIA 元素。
+                // 以前这里写死 ClassNameProperty=="Shell_TrayWnd" 从根往下找：
+                // 主屏没问题，但副屏任务栏（Shell_SecondaryTrayWnd）会量到主屏的按钮，
+                // 于是副屏拿着主屏坐标去算几何 → 画面必错（错位/裁穿，但不崩）。
+                AutomationElement bar;
+                try { bar = AutomationElement.FromHandle(barHwnd); }
+                catch { bar = null; }
                 if (bar == null) return false;
 
                 AutomationElementCollection all = bar.FindAll(TreeScope.Descendants, Condition.TrueCondition);
@@ -1057,9 +1770,9 @@ namespace Dockify
                     AutomationElement e = all[i];
                     System.Windows.Rect rc = e.Current.BoundingRectangle;
                     if (rc.IsEmpty || rc.Width <= 1 || rc.Height <= 1) continue;
-                    if (rc.Width > barW * 0.9) continue;                        // 整条任务栏的背景容器
+                    if (rc.Width > barW * BackgroundWidthRatio) continue;                        // 整条任务栏的背景容器
                     if (e.Current.ControlType != ControlType.Button) continue;  // 只信按钮
-                    if (rc.Width < 30 && rc.Right >= barRect.Right - 30) continue; // 「显示桌面」细条
+                    if (rc.Width < ShowDesktopStripPx && rc.Right >= barRect.Right - ShowDesktopStripPx) continue; // 「显示桌面」细条
                     xs.Add(new int[] { (int)rc.Left, (int)rc.Right });
                 }
                 if (xs.Count < 3) return false;      // 任务栏没唤出时这里会是 0
@@ -1067,7 +1780,9 @@ namespace Dockify
                 xs.Sort(delegate(int[] a, int[] b) { return a[0].CompareTo(b[0]); });
 
                 // 托盘宽度取「托盘窗口」的宽度（稳定、与语言无关）
-                int trayWndW = Scale(240, 1.0);
+                // 按真实 DPI 缩放（原来写死 factor=1，高缩放下托盘宽度估计偏小）
+                double mf = Settings.ScaleWithDpi ? (DpiFor(barHwnd) / 96.0) : 1.0;
+                int trayWndW = Scale(TrayFallbackWidthPx, mf);
                 IntPtr trayWnd = FindChildByClass(barHwnd, Native.ChildTray);
                 if (trayWnd != IntPtr.Zero)
                 {
@@ -1111,25 +1826,45 @@ namespace Dockify
         //   4. 图标变多 → 图标右端变远 → 内容区自动变宽（这就是「新增图标自适应伸缩」），变少则自动收窄；
         //   5. 全部是**绝对计算**，没有任何"拿上次结果再推一次"的反馈，所以不可能累积跑偏；
         //   6. 任务栏窗口自始至终不动 → 自动隐藏照常工作。
-        private bool BuildCompactDock(IntPtr h, double factor, Native.RECT barRect, out int pillLeft, out int pillRight)
+        /// <summary>
+        /// 紧凑 Dock 的核心：算内容区宽度、算整体平移、算出短条的左右边界。返回 false 表示退回「裁两端」。
+        /// </summary>
+        /// <param name="h">任务栏窗口句柄。</param>
+        /// <param name="factor">DPI 缩放系数（120 DPI → 1.25），用于缩放内部阈值。</param>
+        /// <param name="barRect">任务栏窗口矩形。</param>
+        /// <param name="pillLeft">出参：短条左边界（相对任务栏客户区，-1 = 本轮不要动裁切）。</param>
+        /// <param name="pillRight">出参：短条右边界（-1 = 不要动）。</param>
+        /// <returns>true = 本轮保持现有裁切（跳过/暂停）；false = 做不到紧凑 Dock，调用方退回「裁两端」。</returns>
+        /// <summary>
+        /// 本轮该不该「保持现有裁切、什么都不做」。两种情况：
+        /// ① 任务栏被自动隐藏 / 正在滑动 —— 动它会打架，而且 UIA 这时候拿不到按钮；
+        /// ② 托盘弹出面板开着 —— 这时改任务栏会让面板跟着乱跳。
+        /// </summary>
+        /// <param name="h">任务栏窗口句柄。</param>
+        /// <param name="barRect">任务栏窗口矩形。</param>
+        /// <param name="mon">该任务栏所在显示器的矩形。</param>
+        /// <returns>true = 本轮跳过（保持现状）。</returns>
+        private bool ShouldHoldCurrentCrop(IntPtr h, Native.RECT barRect, Native.RECT mon)
         {
-            pillLeft = -1;      // -1 = 本轮不要动裁切（保持现状），别把短条弄没了
-            pillRight = -1;
-
-            // 任务栏被自动隐藏/正在滑动时：既不该动它，UIA 也拿不到按钮 → 本轮完全跳过
-            Native.RECT mon = MonitorRect(h);
             if (barRect.Bottom > mon.Bottom || barRect.Top < mon.Top)
             {
                 _report.AppendLine("  (任务栏在屏幕外/滑动中，保持现有裁切)");
                 return true;
             }
-
-            // 托盘弹出面板开着 → 暂停自动适应，保持现有裁切（否则任务栏会一直跳）
             if (AnyTrayFlyoutVisible(h))
             {
                 _report.AppendLine("  (托盘弹出面板开着 → 暂停自动适应，保持现有裁切)");
                 return true;
             }
+            return false;
+        }
+        private bool BuildCompactDock(IntPtr h, double factor, Native.RECT barRect, out int pillLeft, out int pillRight)
+        {
+            pillLeft = -1;      // -1 = 本轮不要动裁切（保持现状），别把短条弄没了
+            pillRight = -1;
+
+            Native.RECT mon = MonitorRect(h);
+            if (ShouldHoldCurrentCrop(h, barRect, mon)) return true;
 
             IntPtr bridge = FindChildByClass(h, Native.ChildBridge);
             if (bridge == IntPtr.Zero)
@@ -1175,7 +1910,7 @@ namespace Dockify
             int off = PctSigned(Settings.DockOffsetX, mon.Right - mon.Left);
             // 托盘宽度优先用「托盘窗口」的宽度：它稳定，而且比按按钮量的偏大（安全，不会切到时钟）
             int trayW = TrayWindowWidth(h);
-            if (trayW <= 0) trayW = (trayR - trayL > 0 ? trayR - trayL : Scale(240, factor));
+            if (trayW <= 0) trayW = (trayR - trayL > 0 ? trayR - trayL : Scale(TrayFallbackWidthPx, factor));
 
             // 【实测结论，纠正了之前的一个错误假设】
             //   改内容区宽度时，Windows **不会**把程序图标组挪走 —— 图标组钉在原处，
@@ -1193,9 +1928,9 @@ namespace Dockify
             // 现在只有三个稳定机制：
             //   ① 宽度按"图标右端 + 间距 + 托盘宽 + 余量"算，托盘贴身不重叠、增删图标自动伸缩；
             //   ② **硬上限**：宽度绝不允许等于整条任务栏宽（否则触发整屏重排，全局崩）；
-            //   ③ 短条紧贴内容；若明显偏心，就把短的那一侧**有限度地**补上（最多 120px），
-            //      既让观感居中、又不会再出现"Windows 图标旁一大坨空白"。
-            int inset = Scale(10, factor);               // 区域右边界收进内容里侧的量（为的是看见圆角）
+            //   ③ 短条紧贴内容（左边界 = 图标左端 − 留白 + 手动微调；右边界 = 内容区右端 − 1 刀）；
+            //      「整体偏移」由用户手动调，程序自己不做对称补齐（做过实测：硬补会切到图标）。
+            int inset = Scale(EdgeInsetPx, factor);               // 区域右边界收进内容里侧的量（为的是看见圆角）
             int safety = inset;                          // 托盘右侧余量：刚好够切一刀
 
             // ============ 宽度：**与内容区位置 relX 无关** ============
@@ -1207,10 +1942,10 @@ namespace Dockify
             int relXOld = _bridgeRelX;
             if (_shiftBlocked) relXOld = 0;
             int cluster = iconR - iconL;
-            if (cluster < Scale(60, factor)) cluster = Scale(60, factor);
+            if (cluster < Scale(MinClusterWidthPx, factor)) cluster = Scale(MinClusterWidthPx, factor);
             int iconCenterRel = (iconL + iconR) / 2 - (barRect.Left + relXOld);
             int minW = cluster + 2 * (gap + trayW) + safety;                     // 不重叠的下限
-            if (minW < Scale(300, factor)) minW = Scale(300, factor);
+            if (minW < Scale(MinDockWidthPx, factor)) minW = Scale(MinDockWidthPx, factor);
             int wantW = iconCenterRel + cluster / 2 + gap + trayW + safety;
             // 内容长度微调：按用户设置把内容区收窄（收太多时 Windows 会开始隐藏图标，属正常现象）
             int trim = PctW(Settings.DockWidthTrim, mon);
@@ -1220,7 +1955,7 @@ namespace Dockify
                 _report.AppendLine("  内容长度微调 -" + trim + "px → 宽 " + wantW);
             }
             if (wantW < minW) wantW = minW;
-            int maxW = cw - Scale(60, factor);                                   // 硬上限：绝不等于整条任务栏宽
+            int maxW = cw - Scale(MaxWidthReservePx, factor);                                   // 硬上限：绝不等于整条任务栏宽
             if (wantW > maxW) wantW = maxW;
             if (wantW < minW)
             {
@@ -1230,33 +1965,45 @@ namespace Dockify
             }
 
             // ============ 平移：让「图标 + 间距 + 托盘」整块落在屏幕中心 ============
+            // 居中目标 = 显示器几何中心（默认行为，不再叠加任何偏差）。
+            // 可选「视角重心补偿」：短条左边界贴着「图标左端 − 留白」、右边界贴着「内容区右端 − 1 刀」，
+            // 两侧"多出来的边"并不对称，所以短条的【几何中心】与【视觉重心】本来不重合。
+            // 勾选后按 VisualCenterBiasPct 再右移一点（默认关闭 —— 这个偏差因人因屏而异，实测容易看错）。
+            // 居中目标 = 显示器几何中心。
+            // 想让整条 Dock 整体左右挪，用设置里的「整体偏移」（% 屏宽）—— 那是唯一的整体位移入口；
+            // 想按"视觉重心"再偏一点，用可选的「视角重心补偿」。
             int center = (mon.Left + mon.Right) / 2;
+            if (Settings.VisualCenterComp)
+                center += PctSigned(VisualCenterBiasPct, mon.Right - mon.Left);
             // 居中基准用**短条本身**的中心（而不是整块中心）——
             // 这样左侧多裁/多加留白时，短条依然保持居中。
             int curCenter = ((iconL - off) + (relXOld + wantW - inset)) / 2;
-            int delta = center - curCenter;
+            // 手动「整体偏移」：永远生效，叠加在自动居中之上；
+            // 自动居中若被自检判定无效（_shiftBlocked），至少手动值还能用。
+            int manual = PctSigned(Settings.DockShiftX, mon.Right - mon.Left);
+            int delta = _shiftBlocked ? manual : (center - curCenter + manual);
             int applied = 0;
-            if (!_shiftBlocked && Math.Abs(delta) > Scale(3, factor) && Math.Abs(delta) < cw / 3)
+            if (Math.Abs(delta) > Scale(ShiftEpsilonPx, factor) && Math.Abs(delta) < cw / 3)
             {
                 int newRelX = relXOld + delta;
-                int minRelX = -(iconL - barRect.Left - Scale(40, factor));   // 图标左端别出屏
+                int minRelX = -(iconL - barRect.Left - Scale(IconLeftGuardPx, factor));   // 图标左端别出屏
                 if (newRelX < minRelX) newRelX = minRelX;
                 if (newRelX + wantW > cw) newRelX = cw - wantW;
                 applied = newRelX - relXOld;
-                _report.AppendLine("  整组平移 " + applied + "px（往" + (applied < 0 ? "左" : "右") + "）");
+                _report.AppendLine("  整组平移 " + applied + "px（往" + (applied < 0 ? "左" : "右") + "，其中手动偏移 " + manual + "px）");
             }
 
             // 自检：上一拍平移过、这一拍整块中心却还差很远（>150px）→ 最多 3 次就永久放弃平移
-            if (!_shiftBlocked && applied == 0 && Math.Abs(curCenter - center) > Scale(150, factor))
+            if (!_shiftBlocked && manual == 0 && applied == 0 && Math.Abs(curCenter - center) > Scale(ShiftAbandonPx, factor))
             {
                 _shiftMisses++;
-                if (_shiftMisses >= 3)
+                if (_shiftMisses >= ShiftMissLimit)
                 {
                     _shiftBlocked = true;
                     _report.AppendLine("  ! 平移连续 3 次没效果 → 永久放弃平移，只紧贴内容");
                 }
             }
-            else if (applied != 0 || Math.Abs(curCenter - center) <= Scale(150, factor))
+            else if (applied != 0 || Math.Abs(curCenter - center) <= Scale(ShiftAbandonPx, factor))
             {
                 _shiftMisses = 0;
             }
@@ -1317,6 +2064,23 @@ namespace Dockify
             // 托盘窗口挪到「图标右端 + 间距」，音量/时钟弹出面板才会跟着走
             MoveTrayToContentRight(h, client, barRect, relX + wantW);
 
+            // ============ 图标组位移：弹出窗口补正的唯一依据 ============
+            // 未加 Dock 时程序图标组是**屏幕居中**的（本项目实测结论），自然左端 = (cw − cluster)/2；
+            // 加 Dock 后被平移了 applied，两者之差就是"Explorer 算弹出窗口位置时不知道的那段位移"。
+            // 悬停预览与 ^ 展开面板都按它补正 —— 图标增减时它会自己变，所以不需要写死百分比。
+            _rowShift = (iconL + applied - barRect.Left) - (cw - cluster) / 2;
+            _dockRelXSticky = relX;
+            _rowShiftSticky = _rowShift;      // 供悬停预览岛跟随使用（弹窗打开时本拍会跳过构建，所以要粘住上次的值）
+            _report.AppendLine("  图标组位移 " + _rowShift + "px（相对自然居中位置，负=被左推）");
+            if (Settings.CalibIconShift == int.MinValue)
+            {
+                // 首次跑通（或从旧版本升级上来）：把当前几何记为基准，
+                // 这样"用户此前调好的偏移量"在当下分毫不差，之后图标增减才自动跟随。
+                Settings.CalibIconShift = _rowShift;
+                Settings.Save();
+                _report.AppendLine("  已自动校准弹出窗口基准 CalibIconShift=" + _rowShift);
+            }
+
             _clusterOk = true;
             _clusterUsed = true;
             _report.AppendLine("  短条=" + unionL + ".." + unionR +
@@ -1325,6 +2089,9 @@ namespace Dockify
         }
         // 把托盘窗口挪到内容右端（相对父窗口客户区）
         // 托盘窗口的宽度（稳定值；比按按钮量的偏大，用作安全余量）
+        /// <summary>
+        /// 托盘窗口宽度。比从 UIA 推更稳，且与系统语言无关。
+        /// </summary>
         private int TrayWindowWidth(IntPtr h)
         {
             IntPtr tray = FindChildByClass(h, Native.ChildTray);
@@ -1346,7 +2113,7 @@ namespace Dockify
             int wantRelX = (contentRightAbs - barRect.Left) - trayW;
             int curRelX = tr.Left - barRect.Left;
             int relY = tr.Top - barRect.Top;
-            _trayShift = wantRelX - (client.Right - trayW);   // 相对"贴最右"的自然位置平移了多少
+
             if (Math.Abs(curRelX - wantRelX) <= 2) return;
 
             if (!Native.MoveWindow(tray, wantRelX, relY, trayW, trayH, true))
@@ -1374,7 +2141,7 @@ namespace Dockify
         private void RestoreCluster()
         {
             _clusterUsed = false;
-            _trayShift = 0;
+
             _bridgeWidth = 0;
             _bridgeSized = false;
 
@@ -1401,6 +2168,9 @@ namespace Dockify
             catch { }
         }
         // 把任务栏的内容区与托盘还原成系统默认布局（内容区整宽、托盘贴最右）
+        /// <summary>
+        /// 退出/关机时把任务栏彻底还原：内容区、托盘、区域、对齐方式。
+        /// </summary>
         private static void RestoreBarChildren(IntPtr h)
         {
             Native.RECT client;
@@ -1431,6 +2201,9 @@ namespace Dockify
     // --------------------------------------------------------- HiddenWindow
 
     // 一个不显示的窗口，用来收系统消息（注销 / 关机 / 分辨率变化时立刻响应）
+    /// <summary>
+    /// 隐藏的消息窗口：给单实例与系统广播（注销/关机/分辨率变化/设置变更）一个落点。
+    /// </summary>
     internal sealed class HiddenWindow : NativeWindow
     {
         public event EventHandler EnvironmentChanged;
@@ -1473,15 +2246,13 @@ namespace Dockify
     // -------------------------------------------------------- SettingsForm
 
     // 一行「滑块 + 数字框」
-    internal sealed class SliderRow
-    {
-        public TrackBar Bar;
-        public NumericUpDown Num;
-        public Label Caption;
-        public Label Unit;
-        public bool Syncing;
-    }
+    /// <summary>
+    /// 设置窗口里的整数滑块行（TrackBar + 数值框 + 单位）。
+    /// </summary>
 
+    /// <summary>
+    /// 设置窗口：主界面 + 「更多设置」面板，改动即时预览（Live）。
+    /// </summary>
     internal sealed class SettingsForm : Form
     {
         private const int FormW = 460;
@@ -1491,6 +2262,7 @@ namespace Dockify
         private readonly Settings _working;
 
         private CheckBox _chkEnabled;
+        // ---- 主界面控件（模式 / 裁切 / 紧凑 Dock）----
         private RadioButton _radioCrop;
         private RadioButton _radioDock;
         private PctRow _rowRadius;
@@ -1506,17 +2278,30 @@ namespace Dockify
         private Label _lblDockHeader;
 
         private CheckBox _chkAdvanced;
+        /// <summary>「更多设置」面板（勾选后展开，窗体随之加高）。</summary>
+        // ---- 「更多设置」面板里的控件 ----
         private Panel _advanced;
+        /// <summary>「更多设置 → 上边距」数值框（% 屏高）。</summary>
         private NumericUpDown _numTop;
+        /// <summary>「更多设置 → 下边距」数值框（% 屏高）。</summary>
         private NumericUpDown _numBottom;
         private CheckBox _chkAll;
         private CheckBox _chkDpi;
-        private CheckBox _chkAutoHide;
+        // 「任务栏自动隐藏时也处理」已固定为开启（区域是相对任务栏窗口自身的，滑进滑出不影响），
+        // 所以不再提供勾选框 —— 字段一并去掉，避免留下无处同步的控件引用。
+        private CheckBox _chkVisualCenter;
+        private CheckBox _chkFlyoutFollow;
+        private CheckBox _chkPreviewFollow;
+        private PctRow _rowPreview;
         private PctRow _rowFlyout;
+        private PctRow _rowShift;
 
         private Label _statusLabel;
+        /// <summary>取消按钮。</summary>
         private Button _btnCancel;
+        /// <summary>确定按钮。</summary>
         private Button _btnOk;
+        /// <summary>批量回填控件时为 true，用来抑制 ValueChanged 里的 Live() 重入。</summary>
         private bool _syncingAll;
 
         public SettingsForm(TaskbarEngine engine)
@@ -1631,7 +2416,12 @@ namespace Dockify
             _btnOk.Size = new Size(84, 28);
             _btnOk.Click += delegate
             {
+                // 用户动过哪个偏移，就把"当前几何"记为校准基准 → 动态跟随项归零，
+                // 只保留他调出来的那个残差；之后图标增减才继续自动跟随。
+                bool offsetChanged = (_original.FlyoutOffsetX != _working.FlyoutOffsetX ||
+                                      _original.PreviewOffsetX != _working.PreviewOffsetX);
                 _engine.Settings.CopyFrom(_working);
+                if (offsetChanged) _engine.RecalibratePopups();
                 _engine.Settings.Save();
                 _engine.Tick();
 
@@ -1688,9 +2478,14 @@ namespace Dockify
 
         // 百分比行（两位小数）：给"裁切量"用 —— 百分比天然适配分辨率与系统缩放
         // 百分比滑块的容器（TrackBar 用"百分之一"的整数刻度，数值框显示两位小数）
+        /// <summary>
+        /// 百分比滑块行：TrackBar 用「百分之一」的整数刻度，数值框显示两位小数，两者双向同步。
+        /// </summary>
         private sealed class PctRow
         {
+        /// <summary>百分比滑块的轨道（刻度是"百分之一"的整数）。</summary>
             public TrackBar Bar;
+        /// <summary>与轨道同步的数值框（显示两位小数）。</summary>
             public NumericUpDown Num;
         }
 
@@ -1838,76 +2633,18 @@ namespace Dockify
             if (iv < bar.Minimum) iv = bar.Minimum;
             if (iv > bar.Maximum) iv = bar.Maximum;
             bar.Value = iv;
-            num.Value = (decimal)v;
+            // 与 SyncPctRow 保持同一口径：数值框也要夹紧，否则超范围的值会被写进配置
+            decimal dv = (decimal)v;
+            if (dv < num.Minimum) dv = num.Minimum;
+            if (dv > num.Maximum) dv = num.Maximum;
+            num.Value = dv;
         }
-        private SliderRow MakeSlider(int y, int min, int max, int value, string caption, string unit)
-        {
-            return MakeSlider(this, y, min, max, value, caption, unit);
-        }
-
-        private SliderRow MakeSlider(Control parent, int y, int min, int max, int value, string caption, string unit)
-        {
-            SliderRow row = new SliderRow();
-
-            row.Caption = new Label();
-            row.Caption.Text = caption;
-            row.Caption.Location = new Point(28, y + 5);
-            row.Caption.Size = new Size(88, 22);
-
-            row.Bar = new TrackBar();
-            row.Bar.Minimum = min;
-            row.Bar.Maximum = max;
-            row.Bar.Value = value;
-            row.Bar.TickFrequency = Math.Max(1, (max - min) / 8);
-            row.Bar.SmallChange = 1;
-            row.Bar.LargeChange = Math.Max(1, (max - min) / 8);
-            row.Bar.AutoSize = false;
-            row.Bar.Height = 28;
-            row.Bar.Location = new Point(118, y);
-            row.Bar.Size = new Size(228, 28);
-
-            row.Num = new NumericUpDown();
-            row.Num.Minimum = min;
-            row.Num.Maximum = max;
-            row.Num.Value = value;
-            row.Num.Location = new Point(354, y + 2);
-            row.Num.Size = new Size(62, 24);
-
-            row.Unit = new Label();
-            row.Unit.Text = unit;
-            row.Unit.Location = new Point(420, y + 5);
-            row.Unit.Size = new Size(28, 22);
-
-            row.Bar.ValueChanged += delegate
-            {
-                if (row.Syncing) return;
-                row.Syncing = true;
-                row.Num.Value = row.Bar.Value;
-                row.Syncing = false;
-            };
-            row.Num.ValueChanged += delegate
-            {
-                if (row.Syncing) return;
-                row.Syncing = true;
-                int v = (int)row.Num.Value;
-                if (v < row.Bar.Minimum) v = row.Bar.Minimum;
-                if (v > row.Bar.Maximum) v = row.Bar.Maximum;
-                row.Bar.Value = v;
-                row.Syncing = false;
-            };
-
-            parent.Controls.Add(row.Caption);
-            parent.Controls.Add(row.Bar);
-            parent.Controls.Add(row.Num);
-            parent.Controls.Add(row.Unit);
-            return row;
-        }
-
         private Panel BuildAdvancedPanel()
         {
             Panel p = new Panel();
-            p.Location = new Point(0, 608);
-            p.Size = new Size(FormW, 144);
+            // 紧贴上方「更多设置」勾选框（y=544 结束）之后开始，别留 80px 空白
+            p.Location = new Point(0, 556);
+            p.Size = new Size(FormW, 186);
 
             Label l1 = new Label();
             l1.Text = "上边距";
@@ -1971,21 +2708,43 @@ namespace Dockify
             _chkDpi.CheckedChanged += delegate { _working.ScaleWithDpi = _chkDpi.Checked; Live(); };
             p.Controls.Add(_chkDpi);
 
-            _chkAutoHide = new CheckBox();
-            _chkAutoHide.Text = "任务栏自动隐藏时也处理";
-            _chkAutoHide.Location = new Point(28, 56);
-            _chkAutoHide.Size = new Size(260, 22);
-            _chkAutoHide.Checked = _working.ApplyOnAutoHide;
-            _chkAutoHide.CheckedChanged += delegate { _working.ApplyOnAutoHide = _chkAutoHide.Checked; Live(); };
-            p.Controls.Add(_chkAutoHide);
+            // 「任务栏自动隐藏时也处理」已固定开启、不再给勾选框（见字段处的说明）——
+            // 这里显式写死，避免任何路径把它改回关闭。
+            _working.ApplyOnAutoHide = true;
+
+            // 视角重心补偿：短条的几何中心与视觉重心本不重合，勾选后按 VisualCenterBiasPct 再右移一点。
+            // 默认关闭 —— 这个偏差因人因屏而异（实测很容易看错）。
+            // 位置挪到上一项「任务栏自动隐藏时也处理」让出来的那一行。
+            _chkVisualCenter = new CheckBox();
+            _chkVisualCenter.Text = "视角重心补偿";
+            _chkVisualCenter.Location = new Point(28, 56);
+            _chkVisualCenter.Size = new Size(180, 22);
+            _chkVisualCenter.Checked = _working.VisualCenterComp;
+            _chkVisualCenter.CheckedChanged += delegate { _working.VisualCenterComp = _chkVisualCenter.Checked; Live(); };
+            p.Controls.Add(_chkVisualCenter);
 
             // 托盘弹出面板的额外左移量：由用户自己调（0 = 不调整）
-            _rowFlyout = MakePctRow(p, 76, 0, 50, _working.FlyoutOffsetX, "^面板左移", delegate(double v) { _working.FlyoutOffsetX = v; });
+            // 两个"动态跟随"开关：关掉就退回旧行为（只用固定微调，不随图标增减调整）
+            _chkFlyoutFollow = new CheckBox();
+            _chkFlyoutFollow.Text = "面板动态跟随";
+            _chkFlyoutFollow.Location = new Point(28, 80);
+            _chkFlyoutFollow.Size = new Size(132, 22);
+            _chkFlyoutFollow.Checked = _working.FlyoutFollow;
+            _chkFlyoutFollow.CheckedChanged += delegate { _working.FlyoutFollow = _chkFlyoutFollow.Checked; Live(); };
+            p.Controls.Add(_chkFlyoutFollow);
 
+            _chkPreviewFollow = new CheckBox();
+            _chkPreviewFollow.Text = "预览动态跟随";
+            _chkPreviewFollow.Location = new Point(172, 80);
+            _chkPreviewFollow.Size = new Size(132, 22);
+            _chkPreviewFollow.Checked = _working.PreviewFollow;
+            _chkPreviewFollow.CheckedChanged += delegate { _working.PreviewFollow = _chkPreviewFollow.Checked; Live(); };
+            p.Controls.Add(_chkPreviewFollow);
 
-
-
-
+            // 三行微调都是"动态跟随之上"的残差：正 = 往左
+            _rowFlyout = MakePctRow(p, 104, -25, 25, _working.FlyoutOffsetX, "^面板微调", delegate(double v) { _working.FlyoutOffsetX = v; Live(); });
+            _rowShift = MakePctRow(p, 128, -25, 25, _working.DockShiftX, "整体偏移", delegate(double v) { _working.DockShiftX = v; Live(); });
+            _rowPreview = MakePctRow(p, 152, -25, 25, _working.PreviewOffsetX, "预览微调", delegate(double v) { _working.PreviewOffsetX = v; Live(); });
 
             return p;
         }
@@ -1994,10 +2753,12 @@ namespace Dockify
         {
             bool adv = _chkAdvanced.Checked;
             _advanced.Visible = adv;
-            // 高级区展开时把窗体加高，主按钮跟着往下挪
-            int height = adv ? 824 : 710;
+            // 展开：面板 556..742 → 按钮 748、状态行 780、窗体 810（内容到 802，只留 8px）
+            // 收起：主界面内容到 544 → 按钮 572、状态行 604、窗体 640
+            //       （旧值 604/710 会在下半部留出 110px 空白）
+            int height = adv ? 810 : 640;
             ClientSize = new Size(FormW, height);
-            int btnY = adv ? 718 : 604;
+            int btnY = adv ? 748 : 572;
             _btnCancel.Location = new Point(FormW - 196, btnY);
             _btnOk.Location = new Point(FormW - 104, btnY);
             if (_statusLabel != null) _statusLabel.Location = new Point(16, btnY + 32);
@@ -2021,6 +2782,10 @@ namespace Dockify
             _rowWidth.Num.Enabled = dock;
             _rowDockGap.Bar.Enabled = dock;
             _rowDockGap.Num.Enabled = dock;
+            if (_chkVisualCenter != null) _chkVisualCenter.Enabled = dock;   // 高级面板可能还没建好
+            if (_chkFlyoutFollow != null) _chkFlyoutFollow.Enabled = dock;
+            if (_chkPreviewFollow != null) _chkPreviewFollow.Enabled = dock;
+            if (_rowPreview != null) { _rowPreview.Bar.Enabled = dock; _rowPreview.Num.Enabled = dock; }
             _lblDockHeader.ForeColor = dock ? Color.FromArgb(70, 70, 70) : Color.FromArgb(170, 170, 170);
         }
 
@@ -2040,8 +2805,13 @@ namespace Dockify
             _numBottom.Value = (decimal)_working.MarginBottom;
             _chkAll.Checked = _working.AllMonitors;
             _chkDpi.Checked = _working.ScaleWithDpi;
-            _chkAutoHide.Checked = _working.ApplyOnAutoHide;
+            // 「任务栏自动隐藏时也处理」已无勾选框，固定为开启
+            _working.ApplyOnAutoHide = true;
             SyncPctRow(_rowFlyout, _working.FlyoutOffsetX);
+            SyncPctRow(_rowShift, _working.DockShiftX);
+            SyncPctRow(_rowPreview, _working.PreviewOffsetX);
+            if (_chkFlyoutFollow != null) _chkFlyoutFollow.Checked = _working.FlyoutFollow;
+            if (_chkPreviewFollow != null) _chkPreviewFollow.Checked = _working.PreviewFollow;
             SyncPctRow(_rowWidth, _working.DockWidthTrim);
             SyncPctRow(_rowDockOffset, _working.DockOffsetX);
             _syncingAll = false;
@@ -2049,6 +2819,9 @@ namespace Dockify
         }
 
         // 改动即时预览：直接改引擎正在用的设置对象，让托盘那边的节拍去套用
+        /// <summary>
+        /// 把工作副本推给引擎并立刻重算 —— 所有滑块的「拖动即时生效」都靠它。
+        /// </summary>
         private void Live()
         {
             if (_syncingAll) return;
@@ -2057,6 +2830,9 @@ namespace Dockify
             if (_statusLabel != null) _statusLabel.Text = "状态：" + _engine.Status;
         }
 
+        /// <summary>
+        /// 把当前面板恢复成出厂默认值。
+        /// </summary>
         private void ApplyDefaults()
         {
             Settings d = new Settings();
@@ -2076,24 +2852,41 @@ namespace Dockify
 
     // ---------------------------------------------------------- Program
 
+    /// <summary>
+    /// 程序入口：单实例、托盘图标与菜单、命令行分支、启动自检与退出还原。
+    /// </summary>
     internal static class Program
     {
         private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValueName = "Dockify";
+        private const string TaskName = "Dockify";    // 计划任务名（最高权限自启用）
 
         private static Mutex _mutex;
+        /// <summary>核心引擎实例（整个进程只有这一个）。</summary>
         private static TaskbarEngine _engine;
+        /// <summary>托盘图标。</summary>
         private static NotifyIcon _tray;
+        /// <summary>托盘「启用圆角裁切」菜单项。</summary>
         private static ToolStripMenuItem _miEnable;
+        /// <summary>托盘「开机自动启动」菜单项。</summary>
         private static ToolStripMenuItem _miAutoStart;
+        /// <summary>托盘「模式 → 裁两端」菜单项。</summary>
         private static ToolStripMenuItem _miModeCrop;
+        /// <summary>托盘「模式 → 紧凑 Dock」菜单项。</summary>
         private static ToolStripMenuItem _miModeDock;
+        /// <summary>隐藏消息窗口：收注销/关机/分辨率变化/设置变更广播。</summary>
         private static HiddenWindow _hidden;
+        // 心跳间隔（毫秒）。任务栏增删图标后靠它自动适应。
+        private const int HeartbeatIntervalMs = 500;
+        /// <summary>心跳定时器（WinForms 定时器 → 回调在 UI 线程，天然与界面操作串行）。</summary>
         private static System.Windows.Forms.Timer _timer;
+        /// <summary>托盘图标对象（丢弃前要 Dispose，句柄另由 _iconHandle 管理）。</summary>
         private static Icon _icon;
         private static IntPtr _iconHandle = IntPtr.Zero;
         private static string _lastTip = "";
+        /// <summary>是否已经就"紧凑 Dock 做不到"提示过一次。</summary>
         private static bool _warnedFailure;
+        /// <summary>是否已经就"任务栏操作被拒绝"提示过一次（避免反复弹气泡）。</summary>
         private static bool _warnedCluster;
 
         // 用注册消息来叫醒已经在跑的实例（第二次双击 exe 时把设置窗口弹出来）
@@ -2104,6 +2897,9 @@ namespace Dockify
             get { return ShowSettingsMessage; }
         }
 
+        /// <summary>
+        /// 通知已在运行的实例弹出设置窗口（双击 exe 却看不到界面时的兜底）。
+        /// </summary>
         private static void PostShowSettings()
         {
             try
@@ -2114,29 +2910,85 @@ namespace Dockify
             catch { }
         }
 
-        [STAThread]
-        private static void Main(string[] args)
+        /// <summary>命令行开关。字段名与 Program.Main 里的局部变量一一对应。</summary>
+        private struct CommandLine
         {
-            bool doReset = false;
-            bool doApplyOnly = false;
-            bool openSettings = false;
-            bool doDiag = false;
-            bool relaunched = false;
+            public bool Reset;         // --reset / --restore：还原任务栏后退出
+            public bool ApplyOnly;     // --apply：只套用一次就退出（退出码 0=成功 2=失败）
+            public bool OpenSettings;  // --settings / --config：打开设置窗口
+            public bool Diag;          // --diag / --diagnose：跑一遍并把过程写进诊断报告
+            public bool Relaunched;    // --relaunched：本进程是被"代为重启"拉起来的（内部用）
+        }
 
+        /// <summary>
+        /// 解析命令行。前缀 `--` 与 `/` 等价、大小写不敏感、未知参数忽略。
+        /// </summary>
+        /// <param name="args">原始命令行参数。</param>
+        /// <returns>各开关的取值。</returns>
+        private static CommandLine ParseArgs(string[] args)
+        {
+            CommandLine c = new CommandLine();
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i].ToLowerInvariant().TrimStart('-', '/');
-                if (a == "reset" || a == "restore") doReset = true;
-                else if (a == "apply") doApplyOnly = true;
-                else if (a == "settings" || a == "config") openSettings = true;
-                else if (a == "diag" || a == "diagnose") doDiag = true;
-                else if (a == "relaunched") relaunched = true;      // 已经由资源管理器代为重启过
+                if (a == "reset" || a == "restore") c.Reset = true;
+                else if (a == "apply") c.ApplyOnly = true;
+                else if (a == "settings" || a == "config") c.OpenSettings = true;
+                else if (a == "diag" || a == "diagnose") c.Diag = true;
+                else if (a == "relaunched") c.Relaunched = true;
             }
+            return c;
+        }
+
+        /// <summary>把异常写到 %APPDATA%\Dockify\last-error.txt（排障用）。</summary>
+        internal static void LogError(string where, Exception ex)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Dockify");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "last-error.txt"),
+                    DateTime.Now.ToString("HH:mm:ss") + "  [" + where + "]" + Environment.NewLine + (ex == null ? "(null)" : ex.ToString()),
+                    new System.Text.UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        [STAThread]
+        private static void Main(string[] args)
+        {
+            // 启动顺序（改这块前先读一遍）：
+            //   ① 解析命令行 → ② 设置 DPI 感知 → ③ 抢单实例互斥体（提权重启时要等旧实例退出）
+            //   → ④ --reset / --apply / --diag 这类"跑一次就退"的分支
+            //   → ⑤ 读配置 + 迁移 + 首启写盘 → ⑥ 建引擎、装弹出面板钩子
+            //   → ⑦ 上下文受限就请资源管理器代为重启 → ⑧ 托盘图标 + 500ms 心跳 → ⑨ 消息循环
+            AppDomain.CurrentDomain.UnhandledException += delegate(object se, UnhandledExceptionEventArgs ea)
+            {
+                LogError("UnhandledException", ea.ExceptionObject as Exception);
+            };
+
+            CommandLine cmd = ParseArgs(args);
+            bool doReset = cmd.Reset;
+            bool doApplyOnly = cmd.ApplyOnly;
+            bool openSettings = cmd.OpenSettings;
+            bool doDiag = cmd.Diag;
+            bool relaunched = cmd.Relaunched;
 
             SetDpiAwareness();
 
             bool createdNew;
             _mutex = new Mutex(true, "Dockify.SingleInstance.v1", out createdNew);
+            // 以管理员身份重启时，旧实例可能还没退干净 → 给它最多 5 秒把互斥体让出来，
+            // 否则新实例会以为"已经有一个在跑"而直接退出，结果一个都不剩。
+            if (!createdNew && relaunched)
+            {
+                for (int w = 0; w < 20 && !createdNew; w++)
+                {
+                    Thread.Sleep(250);
+                    _mutex.Dispose();
+                    _mutex = new Mutex(true, "Dockify.SingleInstance.v1", out createdNew);
+                }
+            }
 
             // 恢复模式：不需要常驻
             if (doReset)
@@ -2179,54 +3031,23 @@ namespace Dockify
                 return;
             }
 
+            // 【权限门禁】本程序要改任务栏（资源管理器的窗口），Windows 会拒绝普通进程的
+            // SetWindowRgn / MoveWindow —— 必须管理员运行才生效。
+            // 所以：非管理员启动 → 立刻尝试"以管理员重启自己"（弹 UAC）。
+            //   用户在 UAC 上点"是" → 新的管理员实例接管，本进程退出；
+            //   点"否"（或提权失败） → 本进程直接退出，不常驻、不假装在工作。
+            if (!IsElevated())
+            {
+                TryRelaunchElevated();
+                return;     // 两种情况都退：交给管理员实例（或等用户下次以管理员启动）
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             bool firstRun = !Settings.Exists();
             Settings boot = Settings.Load();
-            if (firstRun) boot.Save();       // 第一次启动就把默认配置写到磁盘，方便直接编辑
-            if (boot.SettingsVersion < 4)
-            {
-                // v3 及以前这几个是「像素」→ v4 起统一改成「占屏幕尺寸的百分比」
-                double sw = 1920, sh = 1080;
-                try { sw = Screen.PrimaryScreen.Bounds.Width; sh = Screen.PrimaryScreen.Bounds.Height; } catch { }
-                if (sw < 100) sw = 1920;
-                if (sh < 100) sh = 1080;
-                if (boot.SettingsVersion >= 3)
-                {
-                    boot.Radius = Math.Round(boot.Radius / sh * 100.0, 2);
-                    boot.DockPadding = Math.Round(boot.DockPadding / sw * 100.0, 2);
-                    boot.ClusterGap = Math.Round(boot.ClusterGap / sw * 100.0, 2);
-                    boot.DockOffsetX = Math.Round(boot.DockOffsetX / sw * 100.0, 2);
-                    boot.DockWidthTrim = Math.Round(boot.DockWidthTrim / sw * 100.0, 2);
-                    boot.FlyoutOffsetX = Math.Round(boot.FlyoutOffsetX / sw * 100.0, 2);
-                }
-                else
-                {
-                    // 更老（v2 及以前）的默认像素值，直接套用新的默认百分比
-                    boot.Radius = 1.11; boot.DockPadding = 1.4; boot.ClusterGap = 0.83;
-                    boot.DockOffsetX = -1.56; boot.DockWidthTrim = 1.04; boot.FlyoutOffsetX = 7.8;
-                }
-                boot.SettingsVersion = 4;
-                boot.Save();
-            }
-            boot.ClampAll();     // 迁移/读取之后统一裁剪到合法范围
-            if (boot.SettingsVersion < 3)
-            {
-                // v2 及以前裁切量是「像素」，v3 起改成「百分比」→ 一次性换算（按 1920 宽估算）
-                boot.MarginLeft = Math.Round(boot.MarginLeft / 19.2, 2);
-                boot.MarginRight = Math.Round(boot.MarginRight / 19.2, 2);
-                boot.MarginTop = Math.Round(boot.MarginTop / 19.2, 2);
-                boot.MarginBottom = Math.Round(boot.MarginBottom / 19.2, 2);
-                boot.SettingsVersion = 3;
-                boot.Save();
-            }
-            if (boot.SettingsVersion < 2)
-            {
-                // 老配置：那时"托盘面板跟随"是默认开的，实测证明它会把面板推偏（补偿两次），所以关掉
-                boot.SettingsVersion = 2;
-                boot.Save();
-            }
+            Settings.Migrate(boot);          // 老配置逐级迁移 + 统一裁剪范围
             ForceCenterAlignment(boot);      // 紧凑 Dock 只在居中的任务栏上成立
             _engine = new TaskbarEngine(boot);
             _engine.Tick();
@@ -2250,12 +3071,12 @@ namespace Dockify
             BuildTray();
 
             _timer = new System.Windows.Forms.Timer();
-            _timer.Interval = 500;
+            _timer.Interval = HeartbeatIntervalMs;
             _timer.Tick += delegate
             {
+                try { _engine.Tick(); } catch (Exception tex) { LogError("Tick", tex); }
                 try
                 {
-                    _engine.Tick();
                     WarnOnceIfBlocked();
                     RefreshTray();
                 }
@@ -2342,7 +3163,6 @@ namespace Dockify
 
             menu.Items.Add(new ToolStripSeparator());
 
-
             _miAutoStart = new ToolStripMenuItem("开机自动启动");
             _miAutoStart.CheckOnClick = true;
             _miAutoStart.Checked = IsAutoStart();
@@ -2361,11 +3181,30 @@ namespace Dockify
             };
             menu.Items.Add(_miAutoStart);
 
+            // 弹窗位置如果哪天看着偏了：把"当前几何"记成新基准，一键重校（不用开设置窗）
+            ToolStripMenuItem miRecal = new ToolStripMenuItem("重新校准弹出面板");
+            miRecal.Click += delegate { _engine.RecalibratePopups(); _engine.Tick(); };
+            menu.Items.Add(miRecal);
+
+            // 【一键对正测量】把"预览岛 / ^ 面板"当前的实际对正数据写进 %APPDATA%\Dockify\align.txt，
+            // 供诊断与自动化测试读取。日常用户也可在排障时发这份数据。
+            ToolStripMenuItem miAlign = new ToolStripMenuItem("测量弹窗/预览对正（写 align.txt）");
+            miAlign.Click += delegate { _engine.MeasurePopupAlignment(); };
+            menu.Items.Add(miAlign);
+
+            // 不是管理员时才给这一项：任务栏操作在普通权限下会被系统拒绝，一键提权最省事。
+            if (!IsElevated())
+            {
+                ToolStripMenuItem miElevate = new ToolStripMenuItem("以管理员身份重启…");
+                miElevate.Click += delegate { RelaunchElevated(); };
+                menu.Items.Add(miElevate);
+            }
+
             ToolStripMenuItem miAbout = new ToolStripMenuItem("关于");
             miAbout.Click += delegate
             {
                 MessageBox.Show(
-                    "任务栏圆角 (Dockify)\n\n" +
+                    "任务栏圆角 · Dockify v1.2\n\n" +
                     "用窗口区域 (SetWindowRgn) 把任务栏裁成两侧不贴边的圆角条。\n" +
                     "当前：" + _engine.Status + "\n\n" +
                     "配置文件：" + Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) +
@@ -2376,13 +3215,20 @@ namespace Dockify
             menu.Items.Add(miAbout);
             menu.Items.Add(new ToolStripSeparator());
 
+            // 重新加载设置：本程序启动时只读一次 settings.ini，之后不监视文件。
+            // 手改了配置、或想让新几何重新测量时，用这项最省事（不必去任务管理器结束进程）。
+            // 注意：本进程已是管理员 → 拉起的子进程直接继承管理员，不会再弹 UAC。
+            ToolStripMenuItem miRestart = new ToolStripMenuItem("重启 Dockify（重新加载设置）");
+            miRestart.Click += delegate { RestartSelf(); };
+            menu.Items.Add(miRestart);
+
             ToolStripMenuItem miExit = new ToolStripMenuItem("退出");
             miExit.Click += delegate { Application.Exit(); };
             menu.Items.Add(miExit);
 
             _tray = new NotifyIcon();
             _tray.Icon = _icon;
-            _tray.Text = "Dockify";
+            _tray.Text = "Dockify v1.2";
             _tray.Visible = true;
             _tray.ContextMenuStrip = menu;
             _tray.DoubleClick += delegate { OpenSettings(); };
@@ -2519,6 +3365,9 @@ namespace Dockify
         }
 
         // 启动时：把任务栏临时改成居中（并记住用户原本的设置）
+        /// <summary>
+        /// 紧凑 Dock 要求任务栏居中。若用户原本是「居左」，临时改写系统设置并把原值记进配置，退出时还原。
+        /// </summary>
         private static void ForceCenterAlignment(Settings st)
         {
             try
@@ -2541,6 +3390,9 @@ namespace Dockify
         }
 
         // 退出时：还原用户原本的对齐方式
+        /// <summary>
+        /// 把任务栏对齐方式还原成用户原本的设置。
+        /// </summary>
         private static void RestoreAlignment()
         {
             try
@@ -2555,6 +3407,10 @@ namespace Dockify
         }
         // 把最近一拍的完整测量过程写到 diag.txt（覆盖式）。
         // 这样即便我这边没法操作任务栏，也能读到真实的图标/托盘/内容区数值来定位问题。
+        /// <summary>
+        /// 周期性写「实时诊断」，只在任务栏可见时写，用于长期观察。
+        /// </summary>
+        private static string _lastLiveDiagBody;   // 上一次写入的诊断正文（不含时间戳），用于"没变就不写"
         internal static void WriteLiveDiag(TaskbarEngine engine)
         {
             try
@@ -2562,13 +3418,18 @@ namespace Dockify
                 string path = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Dockify", "diag.txt");
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("Dockify 实时诊断 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-                sb.AppendLine("状态: " + engine.Status + "   生效任务栏数: " + engine.AppliedBars);
+                // 先拼"不带时间戳"的正文，和上次一样就直接返回 ——
+                // 原来每 5 秒无条件重写整个文件，既浪费又让 mtime 失去"有变化"的含义。
+                StringBuilder body = new StringBuilder();
+                body.AppendLine("状态: " + engine.Status + "   生效任务栏数: " + engine.AppliedBars);
                 if (!string.IsNullOrEmpty(Settings.LastSaveError))
-                    sb.AppendLine("配置写入失败: " + Settings.LastSaveError);
-                sb.AppendLine(engine.Report);
-                File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                    body.AppendLine("配置写入失败: " + Settings.LastSaveError);
+                body.AppendLine(engine.Report);
+                string text = body.ToString();
+                if (text == _lastLiveDiagBody) return;
+                _lastLiveDiagBody = text;
+                body.Insert(0, "Dockify 实时诊断 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + Environment.NewLine);
+                File.WriteAllText(path, body.ToString(), new UTF8Encoding(false));
             }
             catch { }
         }
@@ -2593,6 +3454,9 @@ namespace Dockify
 
         // 写诊断报告；AppData 写不进去（受限进程常见）就退到临时目录。
         // 返回实际写入的路径，全都写不进去则返回 null。
+        /// <summary>
+        /// 写诊断报告（含本轮完整测量与套用过程），写不进 AppData 就退到临时目录。
+        /// </summary>
         private static string WriteDiag(TaskbarEngine engine)
         {
             StringBuilder sb = new StringBuilder();
@@ -2641,8 +3505,111 @@ namespace Dockify
             catch { }
         }
 
+        /// <summary>当前进程是否以管理员身份运行。</summary>
+        private static bool IsElevated()
+        {
+            try
+            {
+                using (System.Security.Principal.WindowsIdentity id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                    return new System.Security.Principal.WindowsPrincipal(id)
+                        .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 以管理员身份重启自己（弹 UAC）。用户取消 UAC 时静默返回、什么都不做。
+        /// 用于：普通权限实例改不动任务栏（Windows 会拒绝 SetWindowRgn）时一键提权。
+        /// </summary>
+        private static void RelaunchElevated()
+        {
+            if (!TryRelaunchElevated()) return;         // 用户点了"否" → 留在原样
+            Application.Exit();                          // 已提权实例接管 → 自己退出（退出的钩子会先还原任务栏）
+        }
+
+        /// <summary>
+        /// 尝试以管理员身份重启自己（弹 UAC），返回新实例是否成功拉起。
+        /// 这是"启动时自动提权"的通用方法：很多地方都用得上（程序首次启动门禁、托盘"以管理员重启"等）。
+        /// </summary>
+        /// <returns>true = 用户接受 UAC、新的管理员实例已拉起；false = 用户在 UAC 上点了"否"或启动失败。</returns>
+        private static bool TryRelaunchElevated()
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = Application.ExecutablePath;
+                psi.Arguments = "--relaunched";     // 告诉新实例：旧实例可能还没退干净，等一等互斥体
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";                 // 触发 UAC 提权
+                System.Diagnostics.Process.Start(psi);
+                return true;                        // UAC 已接受，新的管理员实例起来了
+            }
+            catch { return false; }                 // 用户在 UAC 上点了"否"，或系统拒绝
+        }
+
+        /// <summary>
+        /// 重启自己（重新加载 settings.ini）。托盘菜单「重启 Dockify」用。
+        /// 不走 runas：本进程若已是管理员，子进程直接继承管理员令牌 ✓（不会再弹 UAC）；
+        /// 若本进程是普通权限，那子进程也是普通权限 —— 但那种情况启动门禁会立刻把它提权。
+        /// </summary>
+        private static void RestartSelf()
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = Application.ExecutablePath;
+                psi.Arguments = "--relaunched";     // 新实例等一等旧实例让出互斥体
+                psi.UseShellExecute = true;
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch { }
+            Application.Exit();                      // 退出钩子会先还原任务栏，交给新实例重新接管
+        }
+
+        /// <summary>跑一次 schtasks.exe（隐藏窗口），返回是否成功。</summary>
+        private static bool RunSchtasks(string args)
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi =
+                    new System.Diagnostics.ProcessStartInfo("schtasks.exe", args);
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                using (System.Diagnostics.Process pr = System.Diagnostics.Process.Start(psi))
+                {
+                    pr.WaitForExit(8000);
+                    return pr.HasExited && pr.ExitCode == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        /// <summary>计划任务是否存在（存在即认为已自启）。</summary>
+        private static bool AutoStartTaskExists()
+        {
+            return RunSchtasks("/Query /TN \"" + TaskName + "\"");
+        }
+
+        /// <summary>删掉经典的 Run 键启动项（升级到计划任务后要清掉，避免开两次）。</summary>
+        private static void RemoveRunValue()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                    if (k != null) k.DeleteValue(RunValueName, false);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 是否已设为开机自启。两种方式任一存在即为真：
+        /// ① 计划任务 Dockify（**最高权限**，开机即管理员身份、不弹 UAC）
+        /// ② 经典 Run 键（普通权限，作为没有管理员权限时的退路）
+        /// </summary>
         private static bool IsAutoStart()
         {
+            if (AutoStartTaskExists()) return true;
             try
             {
                 using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
@@ -2655,20 +3622,31 @@ namespace Dockify
             catch { return false; }
         }
 
+        /// <summary>
+        /// 设置开机自启。
+        /// 优先建「计划任务 + 最高权限」：这样开机后就是管理员身份静默启动，不需要每次点 UAC ——
+        /// 这正是本程序需要的权限（否则 SetWindowRgn 会被系统拒绝）。
+        /// 没有管理员权限时建不了这种任务，自动退回经典 Run 键（以普通权限启动）。
+        /// </summary>
         private static void SetAutoStart(bool on)
         {
-            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+            string exe = Application.ExecutablePath;
+            if (on)
             {
-                if (k == null) throw new InvalidOperationException("打不开注册表启动项");
-                if (on)
+                bool taskOk = RunSchtasks("/Create /TN \"" + TaskName + "\" /TR \"\\\"" + exe +
+                                          "\\\"\" /SC ONLOGON /RL HIGHEST /DELAY 0000:10 /F");
+                if (taskOk) { RemoveRunValue(); return; }     // 任务建好了，清掉 Run 键免得开两次
+
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
                 {
-                    string exe = Application.ExecutablePath;
+                    if (k == null) throw new InvalidOperationException("打不开注册表启动项");
                     k.SetValue(RunValueName, "\"" + exe + "\"");
                 }
-                else
-                {
-                    k.DeleteValue(RunValueName, false);
-                }
+            }
+            else
+            {
+                RunSchtasks("/Delete /TN \"" + TaskName + "\" /F");
+                RemoveRunValue();
             }
         }
 
@@ -2696,7 +3674,9 @@ namespace Dockify
                 }
             }
             handle = bmp.GetHicon();
-            Icon ic = Icon.FromHandle(handle);
+            // Icon.FromHandle 返回的 Icon 不拥有句柄；Clone 出副本后才能安全 DestroyIcon，
+            // 否则 NotifyIcon 与 DestroyIcon 竞争会残留/失效。
+            Icon ic = (Icon)Icon.FromHandle(handle).Clone();
             bmp.Dispose();
             return ic;
         }
